@@ -74,6 +74,11 @@ class KernelBuilder:
             self.const_map[val] = addr
         return self.const_map[val]
 
+    def reserve_const(self, val, name=None):
+        if val not in self.const_map:
+            self.const_map[val] = self.alloc_scratch(name)
+        return self.const_map[val]
+
     def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
         slots = []
 
@@ -89,89 +94,653 @@ class KernelBuilder:
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Like reference_kernel2 but building actual instructions.
-        Scalar implementation using only scalar ALU and load/store.
+        Vectorized implementation of reference_kernel2.
         """
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
-        tmp3 = self.alloc_scratch("tmp3")
         # Scratch space addresses
         init_vars = [
-            "rounds",
-            "n_nodes",
-            "batch_size",
-            "forest_height",
             "forest_values_p",
-            "inp_indices_p",
             "inp_values_p",
         ]
         for v in init_vars:
             self.alloc_scratch(v, 1)
-        for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
-            self.add("load", ("load", self.scratch[v], tmp1))
-
-        zero_const = self.scratch_const(0)
-        one_const = self.scratch_const(1)
-        two_const = self.scratch_const(2)
+        init_values = {
+            "rounds": rounds,
+            "n_nodes": n_nodes,
+            "batch_size": batch_size,
+            "forest_height": forest_height,
+            "forest_values_p": 7,
+            "inp_indices_p": 7 + n_nodes,
+            "inp_values_p": 7 + n_nodes + batch_size,
+        }
+        init_loads = [
+            ("const", self.scratch[v], init_values[v])
+            for v in init_vars
+        ]
+        for pos in range(0, len(init_loads), SLOT_LIMITS["load"]):
+            self.instrs.append(
+                {"load": init_loads[pos : pos + SLOT_LIMITS["load"]]}
+            )
 
         # Pause instructions are matched up with yield statements in the reference
         # kernel to let you debug at intermediate steps. The testing harness in this
         # file requires these match up to the reference kernel's yields, but the
         # submission harness ignores them.
-        self.add("flow", ("pause",))
+        self.instrs[-1]["flow"] = [("pause",)]
         # Any debug engine instruction is ignored by the submission simulator
         self.add("debug", ("comment", "Starting loop"))
 
-        body = []  # array of slots
+        setup_flow_slots = []
+        setup_phase = False
 
-        # Scalar scratch registers
-        tmp_idx = self.alloc_scratch("tmp_idx")
-        tmp_val = self.alloc_scratch("tmp_val")
-        tmp_node_val = self.alloc_scratch("tmp_node_val")
-        tmp_addr = self.alloc_scratch("tmp_addr")
+        def emit(**engines):
+            if setup_phase and setup_flow_slots and "flow" not in engines:
+                engines["flow"] = [setup_flow_slots.pop(0)]
+            self.instrs.append(
+                {
+                    name: slots
+                    for name, slots in engines.items()
+                    if slots
+                }
+            )
 
-        for round in range(rounds):
-            for i in range(batch_size):
-                i_const = self.scratch_const(i)
-                # idx = mem[inp_indices_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("load", ("load", tmp_idx, tmp_addr)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
-                # val = mem[inp_values_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("load", ("load", tmp_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
-                # node_val = mem[forest_values_p + idx]
-                body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
-                body.append(("load", ("load", tmp_node_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_node_val, (round, i, "node_val"))))
-                # val = myhash(val ^ node_val)
-                body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
-                body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
-                body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
-                # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                body.append(("alu", ("%", tmp1, tmp_val, two_const)))
-                body.append(("alu", ("==", tmp1, tmp1, zero_const)))
-                body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
-                body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
-                body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "next_idx"))))
-                # idx = 0 if idx >= n_nodes else idx
-                body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
-                body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
-                # mem[inp_indices_p + i] = idx
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_idx)))
-                # mem[inp_values_p + i] = val
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_val)))
+        n_vec_groups = (batch_size + VLEN - 1) // VLEN
+        max_groups = n_vec_groups
+        idx = [self.alloc_scratch(f"idx{g}", VLEN) for g in range(max_groups)]
+        val = [self.alloc_scratch(f"val{g}", VLEN) for g in range(max_groups)]
+        addr = [self.alloc_scratch(f"addr{g}", VLEN) for g in range(max_groups)]
+        tmpa = [self.alloc_scratch(f"tmpa{g}", VLEN) for g in range(max_groups)]
+        tmpb = [self.alloc_scratch(f"tmpb{g}", VLEN) for g in range(max_groups)]
+        store_ptr = [self.alloc_scratch(f"store_ptr{g}") for g in range(max_groups)]
+        setup_flow_slots = [
+            ("add_imm", store_ptr[g], self.scratch["inp_values_p"], g * VLEN)
+            for g in range(max_groups)
+        ]
+        setup_phase = True
+        one_v = self.alloc_scratch("one_v", VLEN)
+        two_v = self.alloc_scratch("two_v", VLEN)
+        root_child_base_v = self.alloc_scratch("root_child_base_v", VLEN)
+        addr_update_const_v = self.alloc_scratch("addr_update_const_v", VLEN)
+        addr_update_odd_v = self.alloc_scratch("addr_update_odd_v", VLEN)
+        root_value = self.alloc_scratch("root_value")
+        root_value_v = self.alloc_scratch("root_value_v", VLEN)
+        level1_diff = self.alloc_scratch("level1_diff")
+        level1_right_v = self.alloc_scratch("level1_right_v", VLEN)
+        level1_diff_v = self.alloc_scratch("level1_diff_v", VLEN)
+        level2_right_v = [
+            self.alloc_scratch(f"level2_right_v{i}", VLEN) for i in range(2)
+        ]
+        level2_diff_v = [
+            self.alloc_scratch(f"level2_diff_v{i}", VLEN) for i in range(2)
+        ]
+        level2_split_v = self.alloc_scratch("level2_split_v", VLEN)
+        hash_const_v = {}
+        hash_mult_v = {}
+        for op1, _val1, op2, op3, val3 in HASH_STAGES:
+            if (op1, op2, op3) == ("+", "+", "<<"):
+                c = 1 + (1 << val3)
+                if c not in hash_mult_v:
+                    hash_mult_v[c] = self.alloc_scratch(f"hash_mult_{c:x}", VLEN)
+        for op1, val1, op2, op3, val3 in HASH_STAGES:
+            needed = [val1]
+            if (op1, op2, op3) != ("+", "+", "<<"):
+                needed.append(val3)
+            for c in needed:
+                if c not in hash_const_v:
+                    hash_const_v[c] = self.alloc_scratch(f"hash_const_{c:x}", VLEN)
 
-        body_instrs = self.build(body)
-        self.instrs.extend(body_instrs)
-        # Required to match with the yield in reference_kernel2
-        self.instrs.append({"flow": [("pause",)]})
+        scalar_const_values = [
+            1,
+            2,
+            init_values["forest_values_p"] + 1,
+            1 - init_values["forest_values_p"],
+            2 - init_values["forest_values_p"],
+            init_values["forest_values_p"] + 5,
+            *hash_const_v.keys(),
+            *hash_mult_v.keys(),
+        ]
+        scalar_const_addrs = {}
+        scalar_const_loads = []
+        for c in scalar_const_values:
+            if c in scalar_const_addrs:
+                continue
+            addr_c = self.reserve_const(c)
+            scalar_const_addrs[c] = addr_c
+            scalar_const_loads.append(("const", addr_c, c))
+        one_const = scalar_const_addrs[1]
+        two_const = scalar_const_addrs[2]
+
+        early_const_values = {
+            1,
+            2,
+            init_values["forest_values_p"] + 1,
+            1 - init_values["forest_values_p"],
+            2 - init_values["forest_values_p"],
+        }
+        remaining_const_loads = [
+            ("const", scalar_const_addrs[c], c)
+            for c in scalar_const_values
+            if c not in early_const_values
+        ]
+        seen_remaining = set()
+        remaining_const_loads = [
+            slot
+            for slot in remaining_const_loads
+            if not (slot[2] in seen_remaining or seen_remaining.add(slot[2]))
+        ]
+
+        def take_const_loads(n):
+            res = remaining_const_loads[:n]
+            del remaining_const_loads[:n]
+            return res
+
+        emit(
+            load=[
+                ("load", root_value, self.scratch["forest_values_p"]),
+                ("const", one_const, 1),
+            ]
+        )
+        emit(
+            load=[
+                ("const", two_const, 2),
+                (
+                    "const",
+                    scalar_const_addrs[init_values["forest_values_p"] + 1],
+                    init_values["forest_values_p"] + 1,
+                ),
+            ]
+        )
+        emit(
+            load=[
+                (
+                    "const",
+                    scalar_const_addrs[1 - init_values["forest_values_p"]],
+                    1 - init_values["forest_values_p"],
+                ),
+                (
+                    "const",
+                    scalar_const_addrs[2 - init_values["forest_values_p"]],
+                    2 - init_values["forest_values_p"],
+                ),
+            ]
+        )
+        emit(
+            load=[
+                ("const", tmp1, init_values["forest_values_p"] + 1),
+                ("const", tmp2, init_values["forest_values_p"] + 2),
+            ],
+            valu=[
+                ("vbroadcast", one_v, one_const),
+                ("vbroadcast", two_v, two_const),
+                (
+                    "vbroadcast",
+                    root_child_base_v,
+                    scalar_const_addrs[init_values["forest_values_p"] + 1],
+                ),
+                (
+                    "vbroadcast",
+                    addr_update_const_v,
+                    scalar_const_addrs[1 - init_values["forest_values_p"]],
+                ),
+                (
+                    "vbroadcast",
+                    addr_update_odd_v,
+                    scalar_const_addrs[2 - init_values["forest_values_p"]],
+                ),
+                ("vbroadcast", root_value_v, root_value),
+            ]
+        )
+        emit(
+            load=[
+                ("load", root_value, tmp1),
+                ("load", level1_diff, tmp2),
+            ]
+        )
+        emit(
+            load=take_const_loads(2),
+            alu=[("-", level1_diff, level1_diff, root_value)],
+            valu=[("vbroadcast", level1_right_v, root_value)],
+        )
+        emit(load=take_const_loads(2), valu=[("vbroadcast", level1_diff_v, level1_diff)])
+        level2_pairs = [(3, 4), (5, 6)]
+        for pair_i, (left_node, right_node) in enumerate(level2_pairs):
+            emit(
+                load=[
+                    ("const", tmp1, init_values["forest_values_p"] + left_node),
+                    ("const", tmp2, init_values["forest_values_p"] + right_node),
+                ]
+            )
+            emit(
+                load=[
+                    ("load", root_value, tmp1),
+                    ("load", level1_diff, tmp2),
+                ]
+            )
+            emit(
+                load=take_const_loads(2),
+                alu=[("-", root_value, level1_diff, root_value)],
+                valu=[("vbroadcast", level2_right_v[pair_i], root_value)],
+            )
+            emit(
+                load=take_const_loads(2),
+                valu=[
+                    ("vbroadcast", level2_diff_v[pair_i], root_value),
+                ]
+            )
+        while remaining_const_loads:
+            emit(load=take_const_loads(SLOT_LIMITS["load"]))
+
+        setup_broadcasts = [
+            (
+                "vbroadcast",
+                level2_split_v,
+                scalar_const_addrs[init_values["forest_values_p"] + 5],
+            )
+        ]
+        setup_broadcasts.extend(
+            ("vbroadcast", vec, scalar_const_addrs[c])
+            for c, vec in hash_const_v.items()
+        )
+        setup_broadcasts.extend(
+            ("vbroadcast", vec, scalar_const_addrs[c])
+            for c, vec in hash_mult_v.items()
+        )
+        for pos in range(0, len(setup_broadcasts), SLOT_LIMITS["valu"]):
+            emit(valu=setup_broadcasts[pos : pos + SLOT_LIMITS["valu"]])
+
+        precomputed_store_ptr_count = max_groups - len(setup_flow_slots)
+        setup_phase = False
+
+        for block_start in range(0, n_vec_groups, max_groups):
+            group_count = min(max_groups, n_vec_groups - block_start)
+
+            states = [
+                {
+                    "round": 0,
+                    "phase": "waiting_load",
+                    "ready": 0,
+                    "off": 0,
+                    "store_ready": False,
+                }
+                for _ in range(group_count)
+            ]
+            def advance_after_update(g, ready_cycle):
+                states[g]["round"] += 1
+                states[g]["ready"] = ready_cycle
+                states[g]["off"] = 0
+                if states[g]["round"] >= rounds:
+                    states[g]["phase"] = "store" if states[g]["store_ready"] else "store_addr"
+                elif states[g]["round"] % (forest_height + 1) >= 3:
+                    states[g]["phase"] = "gather"
+                else:
+                    states[g]["phase"] = "addr"
+
+            sched_cycle = 0
+            init_load_pair = 0
+            next_init_ptr = precomputed_store_ptr_count
+            ptr_ready = [
+                0 if g < precomputed_store_ptr_count else 10**9
+                for g in range(group_count)
+            ]
+            for g in range(min(precomputed_store_ptr_count, group_count)):
+                states[g]["store_ready"] = True
+            while any(st["phase"] != "done" for st in states):
+                done_count = sum(st["phase"] == "done" for st in states)
+                if done_count >= 12:
+                    scan_order = list(range(group_count - 1, -1, -1))
+                else:
+                    scan_order = list(range(group_count))
+                load_slots = []
+                alu_slots = []
+                valu_slots = []
+                store_slots = []
+                flow_slots = []
+
+                def add_alu_vec(op, dest, a1, a2):
+                    if op not in ("+", "-", "^", "&", "<<", ">>", "<"):
+                        return False
+                    if len(alu_slots) + VLEN > SLOT_LIMITS["alu"]:
+                        return False
+                    alu_slots.extend(
+                        (op, dest + vi, a1 + vi, a2 + vi) for vi in range(VLEN)
+                    )
+                    return True
+
+                def add_simple_vec(op, dest, a1, a2):
+                    if len(valu_slots) < SLOT_LIMITS["valu"]:
+                        valu_slots.append((op, dest, a1, a2))
+                        return True
+                    return add_alu_vec(op, dest, a1, a2)
+
+                if init_load_pair < group_count and next_init_ptr < group_count:
+                    flow_slots.append(
+                        (
+                            "add_imm",
+                            store_ptr[next_init_ptr],
+                            self.scratch["inp_values_p"],
+                            (block_start + next_init_ptr) * VLEN,
+                        )
+                    )
+                    ptr_ready[next_init_ptr] = sched_cycle + 1
+                    states[next_init_ptr]["store_ready"] = True
+                    next_init_ptr += 1
+
+                if init_load_pair < group_count:
+                    group = range(
+                        init_load_pair,
+                        min(init_load_pair + SLOT_LIMITS["load"], group_count),
+                    )
+                    if all(ptr_ready[g] <= sched_cycle for g in group):
+                        load_slots = [
+                            ("vload", val[g], store_ptr[g])
+                            for g in group
+                        ]
+                        for g in group:
+                            states[g]["phase"] = "addr"
+                            states[g]["ready"] = sched_cycle + 1
+                        init_load_pair += len(load_slots)
+                else:
+                    for g in scan_order:
+                        st = states[g]
+                        if len(load_slots) >= SLOT_LIMITS["load"]:
+                            break
+                        if st["phase"] == "gather" and st["ready"] <= sched_cycle:
+                            load_slots.append(("load_offset", addr[g], idx[g], st["off"]))
+                            st["off"] += 1
+                            if st["off"] == VLEN:
+                                st["phase"] = "xor"
+                                st["ready"] = sched_cycle + 1
+                    for g in scan_order:
+                        st = states[g]
+                        if len(load_slots) >= SLOT_LIMITS["load"]:
+                            break
+                        if st["phase"] == "gather" and st["ready"] <= sched_cycle:
+                            load_slots.append(("load_offset", addr[g], idx[g], st["off"]))
+                            st["off"] += 1
+                            if st["off"] == VLEN:
+                                st["phase"] = "xor"
+                                st["ready"] = sched_cycle + 1
+                    for g in scan_order:
+                        st = states[g]
+                        if len(load_slots) >= SLOT_LIMITS["load"]:
+                            break
+                        if not st["store_ready"]:
+                            load_slots.append(
+                                (
+                                    "const",
+                                    store_ptr[g],
+                                    init_values["inp_values_p"]
+                                    + (block_start + g) * VLEN,
+                                )
+                            )
+                            st["store_ready"] = True
+                            if st["phase"] == "store_addr" and st["ready"] <= sched_cycle:
+                                st["phase"] = "store"
+                                st["ready"] = sched_cycle + 1
+
+                for g in scan_order:
+                    st = states[g]
+                    if len(store_slots) >= SLOT_LIMITS["store"]:
+                        break
+                    if st["phase"] == "store" and st["ready"] <= sched_cycle:
+                        store_slots.append(("vstore", store_ptr[g], val[g]))
+                        st["phase"] = "done"
+                        st["ready"] = sched_cycle + 1
+
+                for g in scan_order:
+                    st = states[g]
+                    if flow_slots:
+                        break
+                    if st["ready"] > sched_cycle:
+                        continue
+                    if st["phase"] == "level2_select_flow":
+                        flow_slots.append(
+                            (
+                                "vselect",
+                                addr[g],
+                                tmpa[g],
+                                addr[g],
+                                tmpb[g],
+                            )
+                        )
+                        st["phase"] = "xor"
+                        st["ready"] = sched_cycle + 1
+                    elif st["phase"] == "select_inc":
+                        flow_slots.append(
+                            (
+                                "vselect",
+                                tmpb[g],
+                                tmpa[g],
+                                addr_update_odd_v,
+                                addr_update_const_v,
+                            )
+                        )
+                        st["phase"] = "madd"
+                        st["ready"] = sched_cycle + 1
+                for g in scan_order:
+                    st = states[g]
+                    if st["ready"] > sched_cycle or st["phase"] in (
+                        "gather",
+                        "waiting_load",
+                        "level2_select_flow",
+                        "select_inc",
+                        "done",
+                    ):
+                        continue
+                    phase = st["phase"]
+                    r = st["round"]
+
+                    if phase == "hash_pre":
+                        hi = st["hash_i"]
+                        op1, val1, _op2, op3, val3 = HASH_STAGES[hi]
+                        if (op1, _op2, op3) == ("+", "+", "<<"):
+                            if len(valu_slots) >= SLOT_LIMITS["valu"]:
+                                break
+                            mult = 1 + (1 << val3)
+                            valu_slots.append(
+                                (
+                                    "multiply_add",
+                                    val[g],
+                                    val[g],
+                                    hash_mult_v[mult],
+                                    hash_const_v[val1],
+                                )
+                            )
+                            st["hash_i"] += 1
+                            if st["hash_i"] < len(HASH_STAGES):
+                                st["phase"] = "hash_pre"
+                            elif r + 1 >= rounds:
+                                advance_after_update(g, sched_cycle + 1)
+                            elif (r + 1) % (forest_height + 1) == 0:
+                                st["phase"] = "zero"
+                            else:
+                                st["phase"] = "parity"
+                            st["ready"] = sched_cycle + 1
+                            continue
+                        if len(valu_slots) + 2 > SLOT_LIMITS["valu"]:
+                            if len(valu_slots) < SLOT_LIMITS["valu"]:
+                                valu_slots.append((op1, tmpa[g], val[g], hash_const_v[val1]))
+                                if add_alu_vec(op3, tmpb[g], val[g], hash_const_v[val3]):
+                                    st["phase"] = "hash_combine"
+                                else:
+                                    st["phase"] = "hash_pre_second"
+                                st["ready"] = sched_cycle + 1
+                            continue
+                        valu_slots.append((op1, tmpa[g], val[g], hash_const_v[val1]))
+                        valu_slots.append((op3, tmpb[g], val[g], hash_const_v[val3]))
+                        st["phase"] = "hash_combine"
+                        st["ready"] = sched_cycle + 1
+                        continue
+                    if phase == "addr":
+                        if r % (forest_height + 1) == 0:
+                            if not add_simple_vec("^", val[g], val[g], root_value_v):
+                                break
+                            st["phase"] = "hash_pre"
+                            st["hash_i"] = 0
+                        elif r % (forest_height + 1) == 1:
+                            if len(valu_slots) >= SLOT_LIMITS["valu"]:
+                                break
+                            valu_slots.append(
+                                (
+                                    "multiply_add",
+                                    addr[g],
+                                    tmpa[g],
+                                    level1_diff_v,
+                                    level1_right_v,
+                                )
+                            )
+                            st["phase"] = "xor"
+                        elif r % (forest_height + 1) == 2:
+                            if len(valu_slots) >= SLOT_LIMITS["valu"]:
+                                break
+                            valu_slots.append(
+                                (
+                                    "multiply_add",
+                                    addr[g],
+                                    tmpa[g],
+                                    level2_diff_v[0],
+                                    level2_right_v[0],
+                                )
+                            )
+                            st["phase"] = "level2_pair1"
+                        else:
+                            st["phase"] = "gather"
+                            st["ready"] = sched_cycle
+                            continue
+                        st["ready"] = sched_cycle + 1
+                    elif phase == "xor":
+                        if not add_simple_vec("^", val[g], val[g], addr[g]):
+                            break
+                        st["phase"] = "hash_pre"
+                        st["hash_i"] = 0
+                        st["ready"] = sched_cycle + 1
+                    elif phase == "level1_select":
+                        if len(valu_slots) >= SLOT_LIMITS["valu"]:
+                            break
+                        valu_slots.append(
+                            ("multiply_add", addr[g], tmpa[g], level1_diff_v, level1_right_v)
+                        )
+                        st["phase"] = "xor"
+                        st["ready"] = sched_cycle + 1
+                    elif phase == "level2_pair0":
+                        if len(valu_slots) >= SLOT_LIMITS["valu"]:
+                            break
+                        valu_slots.append(
+                            (
+                                "multiply_add",
+                                addr[g],
+                                tmpa[g],
+                                level2_diff_v[0],
+                                level2_right_v[0],
+                            )
+                        )
+                        st["phase"] = "level2_pair1"
+                        st["ready"] = sched_cycle + 1
+                    elif phase == "level2_pair1":
+                        if len(valu_slots) >= SLOT_LIMITS["valu"]:
+                            break
+                        valu_slots.append(
+                            (
+                                "multiply_add",
+                                tmpb[g],
+                                tmpa[g],
+                                level2_diff_v[1],
+                                level2_right_v[1],
+                            )
+                        )
+                        st["phase"] = "level2_cmp"
+                        st["ready"] = sched_cycle + 1
+                    elif phase == "level2_cmp":
+                        if not add_simple_vec("<", tmpa[g], idx[g], level2_split_v):
+                            break
+                        st["phase"] = "level2_select_flow"
+                        st["ready"] = sched_cycle + 1
+                    elif phase == "level2_diff":
+                        if not add_simple_vec("-", addr[g], addr[g], tmpb[g]):
+                            break
+                        st["phase"] = "level2_select"
+                        st["ready"] = sched_cycle + 1
+                    elif phase == "level2_select":
+                        if len(valu_slots) >= SLOT_LIMITS["valu"]:
+                            break
+                        valu_slots.append(("multiply_add", addr[g], tmpa[g], addr[g], tmpb[g]))
+                        st["phase"] = "xor"
+                        st["ready"] = sched_cycle + 1
+                    elif phase == "hash_combine":
+                        hi = st["hash_i"]
+                        _op1, _val1, op2, _op3, _val3 = HASH_STAGES[hi]
+                        if not add_simple_vec(op2, val[g], tmpa[g], tmpb[g]):
+                            break
+                        st["hash_i"] += 1
+                        if st["hash_i"] < len(HASH_STAGES):
+                            st["phase"] = "hash_pre"
+                        elif r + 1 >= rounds:
+                            advance_after_update(g, sched_cycle + 1)
+                        elif (r + 1) % (forest_height + 1) == 0:
+                            st["phase"] = "zero"
+                        else:
+                            st["phase"] = "parity"
+                        st["ready"] = sched_cycle + 1
+                    elif phase == "hash_pre_second":
+                        hi = st["hash_i"]
+                        _op1, _val1, _op2, op3, val3 = HASH_STAGES[hi]
+                        if not add_simple_vec(op3, tmpb[g], val[g], hash_const_v[val3]):
+                            break
+                        st["phase"] = "hash_combine"
+                        st["ready"] = sched_cycle + 1
+                    elif phase == "parity":
+                        if not add_simple_vec("&", tmpa[g], val[g], one_v):
+                            break
+                        st["phase"] = (
+                            "root_add_one"
+                            if r % (forest_height + 1) == 0
+                            else "select_inc"
+                        )
+                        st["ready"] = sched_cycle + 1
+                    elif phase == "root_add_one":
+                        if not add_simple_vec("+", idx[g], tmpa[g], root_child_base_v):
+                            break
+                        advance_after_update(g, sched_cycle + 1)
+                    elif phase == "madd":
+                        if len(valu_slots) >= SLOT_LIMITS["valu"]:
+                            break
+                        valu_slots.append(("multiply_add", idx[g], idx[g], two_v, tmpb[g]))
+                        advance_after_update(g, sched_cycle + 1)
+                    elif phase == "add_one":
+                        if not add_simple_vec("+", idx[g], tmpb[g], addr_update_const_v):
+                            break
+                        if (r + 1) % (forest_height + 1) == 0:
+                            st["phase"] = "zero"
+                            st["ready"] = sched_cycle + 1
+                        else:
+                            advance_after_update(g, sched_cycle + 1)
+                    elif phase == "old_madd":
+                        if len(valu_slots) >= SLOT_LIMITS["valu"]:
+                            break
+                        valu_slots.append(("multiply_add", tmpb[g], idx[g], two_v, tmpa[g]))
+                        st["phase"] = "add_one"
+                        st["ready"] = sched_cycle + 1
+                    elif phase == "zero":
+                        if not add_simple_vec("^", idx[g], idx[g], idx[g]):
+                            break
+                        advance_after_update(g, sched_cycle + 1)
+
+                if load_slots or alu_slots or valu_slots or store_slots or flow_slots:
+                    emit(
+                        load=load_slots,
+                        alu=alu_slots,
+                        valu=valu_slots,
+                        store=store_slots,
+                        flow=flow_slots,
+                    )
+                sched_cycle += 1
+
+        # Required to match with the yield in reference_kernel2.
+        if "flow" not in self.instrs[-1]:
+            self.instrs[-1]["flow"] = [("pause",)]
+        else:
+            self.instrs.append({"flow": [("pause",)]})
 
 BASELINE = 147734
 
