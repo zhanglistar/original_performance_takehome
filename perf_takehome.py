@@ -395,7 +395,7 @@ class KernelBuilder:
                     store_scan_order = list(range(group_count - 1, -1, -1))
                 else:
                     store_scan_order = list(range(group_count))
-                if done_count >= 16:
+                if done_count >= 13:
                     flow_scan_order = list(range(group_count - 1, -1, -1))
                 else:
                     flow_scan_order = list(range(group_count))
