@@ -149,6 +149,7 @@ class KernelBuilder:
         max_groups = n_vec_groups
         use_level3_cache = True
         level3_rounds = {14}
+        level3_round3_groups = {20, 21, 22, 25, 26, 28, 29, 30}
         idx = [self.alloc_scratch(f"idx{g}", VLEN) for g in range(max_groups)]
         val = [self.alloc_scratch(f"val{g}", VLEN) for g in range(max_groups)]
         addr = [self.alloc_scratch(f"addr{g}", VLEN) for g in range(max_groups)]
@@ -500,7 +501,13 @@ class KernelBuilder:
                 states[g]["off"] = 0
                 if states[g]["round"] >= rounds:
                     states[g]["phase"] = "store" if states[g]["store_ready"] else "store_addr"
-                elif use_level3_cache and states[g]["round"] in level3_rounds:
+                elif use_level3_cache and (
+                    states[g]["round"] in level3_rounds
+                    or (
+                        states[g]["round"] == 3
+                        and g in level3_round3_groups
+                    )
+                ):
                     states[g]["phase"] = "addr"
                 elif states[g]["round"] % (forest_height + 1) >= 3:
                     states[g]["phase"] = "gather"
@@ -858,7 +865,10 @@ class KernelBuilder:
                             )
                             st["tmpb_slot"] = tmpb_slot
                             st["phase"] = "level2_pair1"
-                        elif use_level3_cache and r in level3_rounds:
+                        elif use_level3_cache and (
+                            r in level3_rounds
+                            or (r == 3 and g in level3_round3_groups)
+                        ):
                             slots = alloc_two_tmpb_slots()
                             if slots is None:
                                 continue
