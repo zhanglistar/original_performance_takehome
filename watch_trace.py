@@ -1,4 +1,5 @@
 import http.server
+import errno
 import os
 from datetime import datetime
 import webbrowser
@@ -72,10 +73,20 @@ class MyHandler(http.server.BaseHTTPRequestHandler):
 
 # Start the server
 def run(server_class=http.server.HTTPServer, handler_class=MyHandler):
-    server_address = ("", 8000)
-    httpd = server_class(server_address, handler_class)
-    print("Starting httpd...")
-    webbrowser.open("http://localhost:8000")
+    base_port = int(os.environ.get("PORT", "8000"))
+    for port in range(base_port, base_port + 100):
+        try:
+            server_address = ("", port)
+            httpd = server_class(server_address, handler_class)
+            break
+        except OSError as e:
+            if e.errno != errno.EADDRINUSE:
+                raise
+    else:
+        raise RuntimeError(f"No available port in range {base_port}-{base_port + 99}")
+
+    print(f"Starting httpd on http://localhost:{port}")
+    webbrowser.open(f"http://localhost:{port}")
     httpd.serve_forever()
 
 
