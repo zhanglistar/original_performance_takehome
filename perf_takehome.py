@@ -302,14 +302,44 @@ class KernelBuilder:
             alu=[("-", level1_diff, level1_diff, root_value)],
             valu=[("vbroadcast", level1_right_v, root_value)],
         )
-        emit(load=take_const_loads(2), valu=[("vbroadcast", level1_diff_v, level1_diff)])
+        emit(
+            load=take_const_loads(2),
+            valu=[
+                ("vbroadcast", level1_diff_v, level1_diff),
+                (
+                    "vbroadcast",
+                    level2_split_v,
+                    scalar_const_addrs[init_values["forest_values_p"] + 5],
+                ),
+                ("vbroadcast", hash_const_v[0x7ED55D16], scalar_const_addrs[0x7ED55D16]),
+            ],
+        )
         level2_pairs = [(3, 4), (5, 6)]
         for pair_i, (left_node, right_node) in enumerate(level2_pairs):
             emit(
                 load=[
                     ("const", tmp1, init_values["forest_values_p"] + left_node),
                     ("const", tmp2, init_values["forest_values_p"] + right_node),
-                ]
+                ],
+                valu=(
+                    [
+                        (
+                            "vbroadcast",
+                            hash_const_v[0xC761C23C],
+                            scalar_const_addrs[0xC761C23C],
+                        ),
+                        ("vbroadcast", hash_const_v[19], scalar_const_addrs[19]),
+                    ]
+                    if pair_i == 0
+                    else [
+                        ("vbroadcast", hash_const_v[9], scalar_const_addrs[9]),
+                        (
+                            "vbroadcast",
+                            hash_const_v[0xFD7046C5],
+                            scalar_const_addrs[0xFD7046C5],
+                        ),
+                    ]
+                ),
             )
             emit(
                 load=[
@@ -326,28 +356,63 @@ class KernelBuilder:
                 load=take_const_loads(2),
                 valu=[
                     ("vbroadcast", level2_diff_v[pair_i], root_value),
+                    *(
+                        [
+                            (
+                                "vbroadcast",
+                                hash_const_v[0x165667B1],
+                                scalar_const_addrs[0x165667B1],
+                            ),
+                            (
+                                "vbroadcast",
+                                hash_const_v[0xD3A2646C],
+                                scalar_const_addrs[0xD3A2646C],
+                            ),
+                        ]
+                        if pair_i == 0
+                        else [
+                            (
+                                "vbroadcast",
+                                hash_const_v[0xB55A4F09],
+                                scalar_const_addrs[0xB55A4F09],
+                            ),
+                            ("vbroadcast", hash_const_v[16], scalar_const_addrs[16]),
+                        ]
+                    ),
+                    *(
+                        [("vbroadcast", hash_mult_v[9], scalar_const_addrs[9])]
+                        if pair_i == 1 and 9 in hash_mult_v
+                        else []
+                    ),
                 ]
             )
         while remaining_const_loads:
             emit(load=take_const_loads(SLOT_LIMITS["load"]))
 
-        setup_broadcasts = [
-            (
-                "vbroadcast",
-                level2_split_v,
-                scalar_const_addrs[init_values["forest_values_p"] + 5],
-            )
-        ]
+        setup_broadcasts = []
+        early_hash_consts = {
+            init_values["forest_values_p"] + 5,
+            0x7ED55D16,
+            0xC761C23C,
+            19,
+            0x165667B1,
+            0xD3A2646C,
+            9,
+            0xFD7046C5,
+            0xB55A4F09,
+            16,
+        }
         setup_broadcasts.extend(
             ("vbroadcast", vec, scalar_const_addrs[c])
             for c, vec in hash_const_v.items()
+            if c not in early_hash_consts
         )
         setup_broadcasts.extend(
             ("vbroadcast", vec, scalar_const_addrs[c])
             for c, vec in hash_mult_v.items()
+            if c != 9
         )
-        for pos in range(0, len(setup_broadcasts), SLOT_LIMITS["valu"]):
-            emit(valu=setup_broadcasts[pos : pos + SLOT_LIMITS["valu"]])
+        pending_setup_broadcasts = setup_broadcasts
 
         precomputed_store_ptr_count = max_groups - len(setup_flow_slots)
         setup_phase = False
@@ -492,6 +557,9 @@ class KernelBuilder:
                             if st["phase"] == "store_addr" and st["ready"] <= sched_cycle:
                                 st["phase"] = "store"
                                 st["ready"] = sched_cycle + 1
+
+                while pending_setup_broadcasts and len(valu_slots) < SLOT_LIMITS["valu"]:
+                    valu_slots.append(pending_setup_broadcasts.pop(0))
 
                 for g in store_scan_order:
                     st = states[g]
