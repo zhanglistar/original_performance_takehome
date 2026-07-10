@@ -153,7 +153,7 @@ class KernelBuilder:
         val = [self.alloc_scratch(f"val{g}", VLEN) for g in range(max_groups)]
         addr = [self.alloc_scratch(f"addr{g}", VLEN) for g in range(max_groups)]
         tmpa = [self.alloc_scratch(f"tmpa{g}", VLEN) for g in range(max_groups)]
-        tmpb_pool_size = 20
+        tmpb_pool_size = 18
         tmpb = [self.alloc_scratch(f"tmpb{i}", VLEN) for i in range(tmpb_pool_size)]
         store_ptr = [self.alloc_scratch(f"store_ptr{g}") for g in range(max_groups)]
         setup_flow_slots = [
@@ -518,7 +518,7 @@ class KernelBuilder:
                 states[g]["store_ready"] = True
             while any(st["phase"] != "done" for st in states):
                 done_count = sum(st["phase"] == "done" for st in states)
-                if done_count >= 7:
+                if done_count >= 22:
                     load_scan_order = list(range(group_count - 1, -1, -1))
                 else:
                     load_scan_order = list(range(group_count))
@@ -526,11 +526,11 @@ class KernelBuilder:
                     store_scan_order = list(range(group_count - 1, -1, -1))
                 else:
                     store_scan_order = list(range(group_count))
-                if done_count >= 13:
+                if done_count >= 0:
                     flow_scan_order = list(range(group_count - 1, -1, -1))
                 else:
                     flow_scan_order = list(range(group_count))
-                if done_count >= 6:
+                if done_count >= 16:
                     valu_scan_order = list(range(group_count - 1, -1, -1))
                 else:
                     valu_scan_order = list(range(group_count))
@@ -551,12 +551,15 @@ class KernelBuilder:
                     return True
 
                 def add_simple_vec(op, dest, a1, a2):
-                    if done_count >= 7 and add_alu_vec(op, dest, a1, a2):
+                    # Prefer ALU for simple ops so VALU stays free for multiply_add.
+                    # ALU has 12 slots but VLEN=8, so at most one spilled vector/cycle
+                    # (alu-8..11 stay idle — can't fit another full vector).
+                    if add_alu_vec(op, dest, a1, a2):
                         return True
                     if len(valu_slots) < SLOT_LIMITS["valu"]:
                         valu_slots.append((op, dest, a1, a2))
                         return True
-                    return add_alu_vec(op, dest, a1, a2)
+                    return False
 
                 def alloc_tmpb_slot():
                     used = {
