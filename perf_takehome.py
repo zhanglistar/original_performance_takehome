@@ -148,8 +148,9 @@ class KernelBuilder:
         n_vec_groups = (batch_size + VLEN - 1) // VLEN
         max_groups = n_vec_groups
         use_level3_cache = True
-        level3_rounds = {14}
+        level3_rounds = set()
         level3_round3_groups = {20, 21, 22, 25, 26, 28, 29, 30}
+        level3_round14_groups = set(range(max_groups)) - {27, 28, 31}
         idx = [self.alloc_scratch(f"idx{g}", VLEN) for g in range(max_groups)]
         val = [self.alloc_scratch(f"val{g}", VLEN) for g in range(max_groups)]
         addr = [self.alloc_scratch(f"addr{g}", VLEN) for g in range(max_groups)]
@@ -503,6 +504,10 @@ class KernelBuilder:
                     states[g]["phase"] = "store" if states[g]["store_ready"] else "store_addr"
                 elif use_level3_cache and (
                     states[g]["round"] in level3_rounds
+                    or (
+                        states[g]["round"] == 14
+                        and g in level3_round14_groups
+                    )
                     or (
                         states[g]["round"] == 3
                         and g in level3_round3_groups
@@ -867,6 +872,7 @@ class KernelBuilder:
                             st["phase"] = "level2_pair1"
                         elif use_level3_cache and (
                             r in level3_rounds
+                            or (r == 14 and g in level3_round14_groups)
                             or (r == 3 and g in level3_round3_groups)
                         ):
                             slots = alloc_two_tmpb_slots()
