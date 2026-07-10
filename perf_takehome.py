@@ -147,11 +147,14 @@ class KernelBuilder:
 
         n_vec_groups = (batch_size + VLEN - 1) // VLEN
         max_groups = n_vec_groups
+        use_level3_cache = True
+        level3_rounds = {14}
         idx = [self.alloc_scratch(f"idx{g}", VLEN) for g in range(max_groups)]
         val = [self.alloc_scratch(f"val{g}", VLEN) for g in range(max_groups)]
         addr = [self.alloc_scratch(f"addr{g}", VLEN) for g in range(max_groups)]
         tmpa = [self.alloc_scratch(f"tmpa{g}", VLEN) for g in range(max_groups)]
-        tmpb = [self.alloc_scratch(f"tmpb{g}", VLEN) for g in range(max_groups)]
+        tmpb_pool_size = 20
+        tmpb = [self.alloc_scratch(f"tmpb{i}", VLEN) for i in range(tmpb_pool_size)]
         store_ptr = [self.alloc_scratch(f"store_ptr{g}") for g in range(max_groups)]
         setup_flow_slots = [
             ("add_imm", store_ptr[g], self.scratch["inp_values_p"], g * VLEN)
@@ -175,6 +178,15 @@ class KernelBuilder:
             self.alloc_scratch(f"level2_diff_v{i}", VLEN) for i in range(2)
         ]
         level2_split_v = self.alloc_scratch("level2_split_v", VLEN)
+        level3_base_v = [
+            self.alloc_scratch(f"level3_base_v{i}", VLEN) for i in range(4)
+        ]
+        level3_diff_v = [
+            self.alloc_scratch(f"level3_diff_v{i}", VLEN) for i in range(4)
+        ]
+        level3_split_v = [
+            self.alloc_scratch(f"level3_split_v{i}", VLEN) for i in range(3)
+        ]
         hash_const_v = {}
         hash_mult_v = {}
         for op1, _val1, op2, op3, val3 in HASH_STAGES:
@@ -199,6 +211,9 @@ class KernelBuilder:
             init_values["forest_values_p"] + 5,
             *hash_const_v.keys(),
             *hash_mult_v.keys(),
+            init_values["forest_values_p"] + 9,
+            init_values["forest_values_p"] + 11,
+            init_values["forest_values_p"] + 13,
         ]
         scalar_const_addrs = {}
         scalar_const_loads = []
@@ -217,6 +232,8 @@ class KernelBuilder:
             init_values["forest_values_p"] + 1,
             1 - init_values["forest_values_p"],
             2 - init_values["forest_values_p"],
+            init_values["forest_values_p"] + 11,
+            init_values["forest_values_p"] + 13,
         }
         remaining_const_loads = [
             ("const", scalar_const_addrs[c], c)
@@ -386,6 +403,51 @@ class KernelBuilder:
                     ),
                 ]
             )
+        emit(
+            load=[
+                (
+                    "const",
+                    scalar_const_addrs[init_values["forest_values_p"] + 11],
+                    init_values["forest_values_p"] + 11,
+                ),
+                (
+                    "const",
+                    scalar_const_addrs[init_values["forest_values_p"] + 13],
+                    init_values["forest_values_p"] + 13,
+                ),
+            ]
+        )
+        for split_i, split_val in enumerate((9, 11, 13)):
+            emit(
+                valu=[
+                    (
+                        "vbroadcast",
+                        level3_split_v[split_i],
+                        scalar_const_addrs[init_values["forest_values_p"] + split_val],
+                    )
+                ]
+            )
+        level3_pairs = [(7, 8), (9, 10), (11, 12), (13, 14)]
+        for pair_i, (even_node, odd_node) in enumerate(level3_pairs):
+            emit(
+                load=[
+                    ("const", tmp1, init_values["forest_values_p"] + even_node),
+                    ("const", tmp2, init_values["forest_values_p"] + odd_node),
+                ]
+            )
+            emit(
+                load=[
+                    ("load", root_value, tmp1),
+                    ("load", level1_diff, tmp2),
+                ]
+            )
+            emit(
+                alu=[("-", level1_diff, level1_diff, root_value)],
+                valu=[("vbroadcast", level3_base_v[pair_i], root_value)],
+            )
+            emit(
+                valu=[("vbroadcast", level3_diff_v[pair_i], level1_diff)]
+            )
         while remaining_const_loads:
             emit(load=take_const_loads(SLOT_LIMITS["load"]))
 
@@ -427,6 +489,8 @@ class KernelBuilder:
                     "ready": 0,
                     "off": 0,
                     "store_ready": False,
+                    "tmpb_slot": None,
+                    "tmpb_slot2": None,
                 }
                 for _ in range(group_count)
             ]
@@ -436,6 +500,8 @@ class KernelBuilder:
                 states[g]["off"] = 0
                 if states[g]["round"] >= rounds:
                     states[g]["phase"] = "store" if states[g]["store_ready"] else "store_addr"
+                elif use_level3_cache and states[g]["round"] in level3_rounds:
+                    states[g]["phase"] = "addr"
                 elif states[g]["round"] % (forest_height + 1) >= 3:
                     states[g]["phase"] = "gather"
                 else:
@@ -491,6 +557,42 @@ class KernelBuilder:
                         valu_slots.append((op, dest, a1, a2))
                         return True
                     return add_alu_vec(op, dest, a1, a2)
+
+                def alloc_tmpb_slot():
+                    used = {
+                        s["tmpb_slot"]
+                        for s in states
+                        if s["tmpb_slot"] is not None
+                    }
+                    used.update(
+                        s["tmpb_slot2"]
+                        for s in states
+                        if s["tmpb_slot2"] is not None
+                    )
+                    for slot_i in range(tmpb_pool_size):
+                        if slot_i not in used:
+                            return slot_i
+                    return None
+
+                def alloc_two_tmpb_slots():
+                    first = alloc_tmpb_slot()
+                    if first is None:
+                        return None
+                    used = {
+                        s["tmpb_slot"]
+                        for s in states
+                        if s["tmpb_slot"] is not None
+                    }
+                    used.update(
+                        s["tmpb_slot2"]
+                        for s in states
+                        if s["tmpb_slot2"] is not None
+                    )
+                    used.add(first)
+                    for second in range(tmpb_pool_size):
+                        if second not in used:
+                            return first, second
+                    return None
 
                 if init_load_pair < group_count and next_init_ptr < group_count:
                     flow_slots.append(
@@ -577,22 +679,75 @@ class KernelBuilder:
                     if st["ready"] > sched_cycle:
                         continue
                     if st["phase"] == "level2_select_flow":
+                        tmpb_slot = st["tmpb_slot"]
+                        if tmpb_slot is None:
+                            continue
                         flow_slots.append(
                             (
                                 "vselect",
                                 addr[g],
                                 tmpa[g],
                                 addr[g],
-                                tmpb[g],
+                                tmpb[tmpb_slot],
                             )
                         )
+                        st["tmpb_slot"] = None
+                        st["phase"] = "xor"
+                        st["ready"] = sched_cycle + 1
+                    elif st["phase"] == "level3_select01_flow":
+                        tmpb_slot = st["tmpb_slot"]
+                        if tmpb_slot is None:
+                            continue
+                        flow_slots.append(
+                            (
+                                "vselect",
+                                addr[g],
+                                tmpa[g],
+                                addr[g],
+                                tmpb[tmpb_slot],
+                            )
+                        )
+                        st["phase"] = "level3_parity2"
+                        st["ready"] = sched_cycle + 1
+                    elif st["phase"] == "level3_select23_flow":
+                        tmpb_slot = st["tmpb_slot"]
+                        tmpb_slot2 = st["tmpb_slot2"]
+                        if tmpb_slot is None or tmpb_slot2 is None:
+                            continue
+                        flow_slots.append(
+                            (
+                                "vselect",
+                                tmpb[tmpb_slot],
+                                tmpa[g],
+                                tmpb[tmpb_slot],
+                                tmpb[tmpb_slot2],
+                            )
+                        )
+                        st["phase"] = "level3_final_cmp"
+                        st["ready"] = sched_cycle + 1
+                    elif st["phase"] == "level3_final_select_flow":
+                        tmpb_slot = st["tmpb_slot"]
+                        tmpb_slot2 = st["tmpb_slot2"]
+                        if tmpb_slot is None:
+                            continue
+                        flow_slots.append(
+                            (
+                                "vselect",
+                                addr[g],
+                                tmpa[g],
+                                addr[g],
+                                tmpb[tmpb_slot],
+                            )
+                        )
+                        st["tmpb_slot"] = None
+                        st["tmpb_slot2"] = None
                         st["phase"] = "xor"
                         st["ready"] = sched_cycle + 1
                     elif st["phase"] == "select_inc":
                         flow_slots.append(
                             (
                                 "vselect",
-                                tmpb[g],
+                                addr[g],
                                 tmpa[g],
                                 addr_update_odd_v,
                                 addr_update_const_v,
@@ -606,6 +761,9 @@ class KernelBuilder:
                         "gather",
                         "waiting_load",
                         "level2_select_flow",
+                        "level3_select01_flow",
+                        "level3_select23_flow",
+                        "level3_final_select_flow",
                         "select_inc",
                         "done",
                     ):
@@ -614,6 +772,13 @@ class KernelBuilder:
                     r = st["round"]
 
                     if phase == "hash_pre":
+                        tmpb_slot = st["tmpb_slot"]
+                        if tmpb_slot is None:
+                            tmpb_slot = alloc_tmpb_slot()
+                            if tmpb_slot is None:
+                                continue
+                            st["tmpb_slot"] = tmpb_slot
+                        hash_tmp = tmpb[tmpb_slot]
                         hi = st["hash_i"]
                         op1, val1, _op2, op3, val3 = HASH_STAGES[hi]
                         if (op1, _op2, op3) == ("+", "+", "<<"):
@@ -643,14 +808,14 @@ class KernelBuilder:
                         if len(valu_slots) + 2 > SLOT_LIMITS["valu"]:
                             if len(valu_slots) < SLOT_LIMITS["valu"]:
                                 valu_slots.append((op1, tmpa[g], val[g], hash_const_v[val1]))
-                                if add_alu_vec(op3, tmpb[g], val[g], hash_const_v[val3]):
+                                if add_alu_vec(op3, hash_tmp, val[g], hash_const_v[val3]):
                                     st["phase"] = "hash_combine"
                                 else:
                                     st["phase"] = "hash_pre_second"
                                 st["ready"] = sched_cycle + 1
                             continue
                         valu_slots.append((op1, tmpa[g], val[g], hash_const_v[val1]))
-                        valu_slots.append((op3, tmpb[g], val[g], hash_const_v[val3]))
+                        valu_slots.append((op3, hash_tmp, val[g], hash_const_v[val3]))
                         st["phase"] = "hash_combine"
                         st["ready"] = sched_cycle + 1
                         continue
@@ -674,6 +839,9 @@ class KernelBuilder:
                             )
                             st["phase"] = "xor"
                         elif r % (forest_height + 1) == 2:
+                            tmpb_slot = alloc_tmpb_slot()
+                            if tmpb_slot is None:
+                                continue
                             if len(valu_slots) >= SLOT_LIMITS["valu"]:
                                 break
                             valu_slots.append(
@@ -685,7 +853,16 @@ class KernelBuilder:
                                     level2_right_v[0],
                                 )
                             )
+                            st["tmpb_slot"] = tmpb_slot
                             st["phase"] = "level2_pair1"
+                        elif use_level3_cache and r in level3_rounds:
+                            slots = alloc_two_tmpb_slots()
+                            if slots is None:
+                                continue
+                            if not add_simple_vec("&", tmpa[g], idx[g], one_v):
+                                break
+                            st["tmpb_slot"], st["tmpb_slot2"] = slots
+                            st["phase"] = "level3_pair0"
                         else:
                             st["phase"] = "gather"
                             st["ready"] = sched_cycle
@@ -720,12 +897,15 @@ class KernelBuilder:
                         st["phase"] = "level2_pair1"
                         st["ready"] = sched_cycle + 1
                     elif phase == "level2_pair1":
+                        tmpb_slot = st["tmpb_slot"]
+                        if tmpb_slot is None:
+                            continue
                         if len(valu_slots) >= SLOT_LIMITS["valu"]:
                             break
                         valu_slots.append(
                             (
                                 "multiply_add",
-                                tmpb[g],
+                                tmpb[tmpb_slot],
                                 tmpa[g],
                                 level2_diff_v[1],
                                 level2_right_v[1],
@@ -749,25 +929,97 @@ class KernelBuilder:
                         valu_slots.append(("multiply_add", addr[g], tmpa[g], addr[g], tmpb[g]))
                         st["phase"] = "xor"
                         st["ready"] = sched_cycle + 1
+                    elif phase == "level3_pair0":
+                        if len(valu_slots) >= SLOT_LIMITS["valu"]:
+                            break
+                        valu_slots.append(
+                            ("multiply_add", addr[g], tmpa[g], level3_diff_v[0], level3_base_v[0])
+                        )
+                        st["phase"] = "level3_pair1"
+                        st["ready"] = sched_cycle + 1
+                    elif phase == "level3_pair1":
+                        tmpb_slot = st["tmpb_slot"]
+                        if tmpb_slot is None:
+                            continue
+                        if len(valu_slots) >= SLOT_LIMITS["valu"]:
+                            break
+                        valu_slots.append(
+                            ("multiply_add", tmpb[tmpb_slot], tmpa[g], level3_diff_v[1], level3_base_v[1])
+                        )
+                        st["phase"] = "level3_cmp01"
+                        st["ready"] = sched_cycle + 1
+                    elif phase == "level3_cmp01":
+                        if not add_simple_vec("<", tmpa[g], idx[g], level3_split_v[0]):
+                            break
+                        st["phase"] = "level3_select01_flow"
+                        st["ready"] = sched_cycle + 1
+                    elif phase == "level3_parity2":
+                        if not add_simple_vec("&", tmpa[g], idx[g], one_v):
+                            break
+                        st["phase"] = "level3_pair2"
+                        st["ready"] = sched_cycle + 1
+                    elif phase == "level3_pair2":
+                        tmpb_slot = st["tmpb_slot"]
+                        if tmpb_slot is None:
+                            continue
+                        if len(valu_slots) >= SLOT_LIMITS["valu"]:
+                            break
+                        valu_slots.append(
+                            ("multiply_add", tmpb[tmpb_slot], tmpa[g], level3_diff_v[2], level3_base_v[2])
+                        )
+                        st["phase"] = "level3_pair3"
+                        st["ready"] = sched_cycle + 1
+                    elif phase == "level3_pair3":
+                        tmpb_slot2 = st["tmpb_slot2"]
+                        if tmpb_slot2 is None:
+                            continue
+                        if len(valu_slots) >= SLOT_LIMITS["valu"]:
+                            break
+                        valu_slots.append(
+                            ("multiply_add", tmpb[tmpb_slot2], tmpa[g], level3_diff_v[3], level3_base_v[3])
+                        )
+                        st["phase"] = "level3_cmp23"
+                        st["ready"] = sched_cycle + 1
+                    elif phase == "level3_cmp23":
+                        if not add_simple_vec("<", tmpa[g], idx[g], level3_split_v[2]):
+                            break
+                        st["phase"] = "level3_select23_flow"
+                        st["ready"] = sched_cycle + 1
+                    elif phase == "level3_final_cmp":
+                        if not add_simple_vec("<", tmpa[g], idx[g], level3_split_v[1]):
+                            break
+                        st["phase"] = "level3_final_select_flow"
+                        st["ready"] = sched_cycle + 1
                     elif phase == "hash_combine":
+                        tmpb_slot = st["tmpb_slot"]
+                        if tmpb_slot is None:
+                            continue
+                        hash_tmp = tmpb[tmpb_slot]
                         hi = st["hash_i"]
                         _op1, _val1, op2, _op3, _val3 = HASH_STAGES[hi]
-                        if not add_simple_vec(op2, val[g], tmpa[g], tmpb[g]):
+                        if not add_simple_vec(op2, val[g], tmpa[g], hash_tmp):
                             break
                         st["hash_i"] += 1
                         if st["hash_i"] < len(HASH_STAGES):
                             st["phase"] = "hash_pre"
                         elif r + 1 >= rounds:
+                            st["tmpb_slot"] = None
                             advance_after_update(g, sched_cycle + 1)
                         elif (r + 1) % (forest_height + 1) == 0:
+                            st["tmpb_slot"] = None
                             st["phase"] = "zero"
                         else:
+                            st["tmpb_slot"] = None
                             st["phase"] = "parity"
                         st["ready"] = sched_cycle + 1
                     elif phase == "hash_pre_second":
+                        tmpb_slot = st["tmpb_slot"]
+                        if tmpb_slot is None:
+                            continue
+                        hash_tmp = tmpb[tmpb_slot]
                         hi = st["hash_i"]
                         _op1, _val1, _op2, op3, val3 = HASH_STAGES[hi]
-                        if not add_simple_vec(op3, tmpb[g], val[g], hash_const_v[val3]):
+                        if not add_simple_vec(op3, hash_tmp, val[g], hash_const_v[val3]):
                             break
                         st["phase"] = "hash_combine"
                         st["ready"] = sched_cycle + 1
@@ -787,7 +1039,7 @@ class KernelBuilder:
                     elif phase == "madd":
                         if len(valu_slots) >= SLOT_LIMITS["valu"]:
                             break
-                        valu_slots.append(("multiply_add", idx[g], idx[g], two_v, tmpb[g]))
+                        valu_slots.append(("multiply_add", idx[g], idx[g], two_v, addr[g]))
                         advance_after_update(g, sched_cycle + 1)
                     elif phase == "add_one":
                         if not add_simple_vec("+", idx[g], tmpb[g], addr_update_const_v):
