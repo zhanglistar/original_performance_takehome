@@ -387,10 +387,22 @@ class KernelBuilder:
                 states[g]["store_ready"] = True
             while any(st["phase"] != "done" for st in states):
                 done_count = sum(st["phase"] == "done" for st in states)
-                if done_count >= 12:
-                    scan_order = list(range(group_count - 1, -1, -1))
+                if done_count >= 7:
+                    load_scan_order = list(range(group_count - 1, -1, -1))
                 else:
-                    scan_order = list(range(group_count))
+                    load_scan_order = list(range(group_count))
+                if done_count >= 0:
+                    store_scan_order = list(range(group_count - 1, -1, -1))
+                else:
+                    store_scan_order = list(range(group_count))
+                if done_count >= 16:
+                    flow_scan_order = list(range(group_count - 1, -1, -1))
+                else:
+                    flow_scan_order = list(range(group_count))
+                if done_count >= 6:
+                    valu_scan_order = list(range(group_count - 1, -1, -1))
+                else:
+                    valu_scan_order = list(range(group_count))
                 load_slots = []
                 alu_slots = []
                 valu_slots = []
@@ -408,6 +420,8 @@ class KernelBuilder:
                     return True
 
                 def add_simple_vec(op, dest, a1, a2):
+                    if done_count >= 7 and add_alu_vec(op, dest, a1, a2):
+                        return True
                     if len(valu_slots) < SLOT_LIMITS["valu"]:
                         valu_slots.append((op, dest, a1, a2))
                         return True
@@ -441,7 +455,7 @@ class KernelBuilder:
                             states[g]["ready"] = sched_cycle + 1
                         init_load_pair += len(load_slots)
                 else:
-                    for g in scan_order:
+                    for g in load_scan_order:
                         st = states[g]
                         if len(load_slots) >= SLOT_LIMITS["load"]:
                             break
@@ -451,7 +465,7 @@ class KernelBuilder:
                             if st["off"] == VLEN:
                                 st["phase"] = "xor"
                                 st["ready"] = sched_cycle + 1
-                    for g in scan_order:
+                    for g in load_scan_order:
                         st = states[g]
                         if len(load_slots) >= SLOT_LIMITS["load"]:
                             break
@@ -461,7 +475,7 @@ class KernelBuilder:
                             if st["off"] == VLEN:
                                 st["phase"] = "xor"
                                 st["ready"] = sched_cycle + 1
-                    for g in scan_order:
+                    for g in load_scan_order:
                         st = states[g]
                         if len(load_slots) >= SLOT_LIMITS["load"]:
                             break
@@ -479,7 +493,7 @@ class KernelBuilder:
                                 st["phase"] = "store"
                                 st["ready"] = sched_cycle + 1
 
-                for g in scan_order:
+                for g in store_scan_order:
                     st = states[g]
                     if len(store_slots) >= SLOT_LIMITS["store"]:
                         break
@@ -488,7 +502,7 @@ class KernelBuilder:
                         st["phase"] = "done"
                         st["ready"] = sched_cycle + 1
 
-                for g in scan_order:
+                for g in flow_scan_order:
                     st = states[g]
                     if flow_slots:
                         break
@@ -518,7 +532,7 @@ class KernelBuilder:
                         )
                         st["phase"] = "madd"
                         st["ready"] = sched_cycle + 1
-                for g in scan_order:
+                for g in valu_scan_order:
                     st = states[g]
                     if st["ready"] > sched_cycle or st["phase"] in (
                         "gather",
