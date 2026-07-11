@@ -149,8 +149,8 @@ class KernelBuilder:
         max_groups = n_vec_groups
         use_level3_cache = True
         level3_rounds = set()
-        level3_round3_groups = {20, 21, 22, 25, 26, 28, 29, 30}
-        level3_round14_groups = set(range(max_groups)) - {27, 28, 31}
+        level3_round3_groups = {2, 20, 21, 22, 25, 26, 29, 30, 31}
+        level3_round14_groups = set(range(max_groups)) - {27, 28, 29, 30, 31}
         idx = [self.alloc_scratch(f"idx{g}", VLEN) for g in range(max_groups)]
         val = [self.alloc_scratch(f"val{g}", VLEN) for g in range(max_groups)]
         addr = [self.alloc_scratch(f"addr{g}", VLEN) for g in range(max_groups)]
@@ -530,7 +530,7 @@ class KernelBuilder:
                 states[g]["store_ready"] = True
             while any(st["phase"] != "done" for st in states):
                 done_count = sum(st["phase"] == "done" for st in states)
-                if done_count >= 22:
+                if done_count >= 19:
                     load_scan_order = list(range(group_count - 1, -1, -1))
                 else:
                     load_scan_order = list(range(group_count))
@@ -542,7 +542,7 @@ class KernelBuilder:
                     flow_scan_order = list(range(group_count - 1, -1, -1))
                 else:
                     flow_scan_order = list(range(group_count))
-                if done_count >= 16:
+                if done_count >= 17:
                     valu_scan_order = list(range(group_count - 1, -1, -1))
                 else:
                     valu_scan_order = list(range(group_count))
