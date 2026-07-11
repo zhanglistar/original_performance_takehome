@@ -491,6 +491,7 @@ class KernelBuilder:
                     "ready": 0,
                     "off": 0,
                     "base_ready": False,
+                    "zero_ready": False,
                     "store_ready": False,
                     "tmpb_slot": None,
                     "tmpb_slot2": None,
@@ -502,6 +503,7 @@ class KernelBuilder:
                 states[g]["ready"] = ready_cycle
                 states[g]["off"] = 0
                 states[g]["base_ready"] = False
+                states[g]["zero_ready"] = False
                 if states[g]["round"] >= rounds:
                     states[g]["phase"] = "store" if states[g]["store_ready"] else "store_addr"
                 elif use_level3_cache and (
@@ -817,7 +819,10 @@ class KernelBuilder:
                             elif r + 1 >= rounds:
                                 advance_after_update(g, sched_cycle + 1)
                             elif (r + 1) % (forest_height + 1) == 0:
-                                st["phase"] = "zero"
+                                if st["zero_ready"]:
+                                    advance_after_update(g, sched_cycle + 1)
+                                else:
+                                    st["phase"] = "zero"
                             else:
                                 st["phase"] = "parity"
                             st["ready"] = sched_cycle + 1
@@ -903,6 +908,14 @@ class KernelBuilder:
                                 ("multiply_add", addr[g], idx[g], two_v, addr_update_const_v)
                             )
                             st["base_ready"] = True
+                        if (
+                            r + 1 < rounds
+                            and (r + 1) % (forest_height + 1) == 0
+                            and done_count >= 19
+                            and len(valu_slots) <= 3
+                        ):
+                            if add_simple_vec("^", idx[g], idx[g], idx[g]):
+                                st["zero_ready"] = True
                         st["phase"] = "hash_pre"
                         st["hash_i"] = 0
                         st["ready"] = sched_cycle + 1
@@ -1039,7 +1052,10 @@ class KernelBuilder:
                             advance_after_update(g, sched_cycle + 1)
                         elif (r + 1) % (forest_height + 1) == 0:
                             st["tmpb_slot"] = None
-                            st["phase"] = "zero"
+                            if st["zero_ready"]:
+                                advance_after_update(g, sched_cycle + 1)
+                            else:
+                                st["phase"] = "zero"
                         else:
                             st["tmpb_slot"] = None
                             st["phase"] = "parity"
