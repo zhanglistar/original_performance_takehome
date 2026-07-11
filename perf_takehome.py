@@ -490,6 +490,7 @@ class KernelBuilder:
                     "phase": "waiting_load",
                     "ready": 0,
                     "off": 0,
+                    "base_ready": False,
                     "store_ready": False,
                     "tmpb_slot": None,
                     "tmpb_slot2": None,
@@ -500,6 +501,7 @@ class KernelBuilder:
                 states[g]["round"] += 1
                 states[g]["ready"] = ready_cycle
                 states[g]["off"] = 0
+                states[g]["base_ready"] = False
                 if states[g]["round"] >= rounds:
                     states[g]["phase"] = "store" if states[g]["store_ready"] else "store_addr"
                 elif use_level3_cache and (
@@ -890,6 +892,17 @@ class KernelBuilder:
                     elif phase == "xor":
                         if not add_simple_vec("^", val[g], val[g], addr[g]):
                             break
+                        if (
+                            r + 1 < rounds
+                            and (r + 1) % (forest_height + 1) != 0
+                            and r % (forest_height + 1) != 0
+                            and done_count >= 19
+                            and len(valu_slots) <= 3
+                        ):
+                            valu_slots.append(
+                                ("multiply_add", addr[g], idx[g], two_v, addr_update_const_v)
+                            )
+                            st["base_ready"] = True
                         st["phase"] = "hash_pre"
                         st["hash_i"] = 0
                         st["ready"] = sched_cycle + 1
@@ -1048,11 +1061,15 @@ class KernelBuilder:
                         st["phase"] = (
                             "root_add_one"
                             if r % (forest_height + 1) == 0
-                            else "select_inc"
+                            else "select_inc_base" if st["base_ready"] else "select_inc"
                         )
                         st["ready"] = sched_cycle + 1
                     elif phase == "root_add_one":
                         if not add_simple_vec("+", idx[g], tmpa[g], root_child_base_v):
+                            break
+                        advance_after_update(g, sched_cycle + 1)
+                    elif phase == "select_inc_base":
+                        if not add_simple_vec("+", idx[g], addr[g], tmpa[g]):
                             break
                         advance_after_update(g, sched_cycle + 1)
                     elif phase == "madd":
