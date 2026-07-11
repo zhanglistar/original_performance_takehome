@@ -419,40 +419,89 @@ class KernelBuilder:
                 ),
             ]
         )
-        for split_i, split_val in enumerate((9, 11, 13)):
-            emit(
-                valu=[
-                    (
-                        "vbroadcast",
-                        level3_split_v[split_i],
-                        scalar_const_addrs[init_values["forest_values_p"] + split_val],
-                    )
-                ]
-            )
         level3_pairs = [(7, 8), (9, 10), (11, 12), (13, 14)]
+        level3_splits = (9, 11, 13)
+        deferred_setup_ops = []
+        emit(
+            load=[
+                ("const", tmp1, init_values["forest_values_p"] + level3_pairs[0][0]),
+                ("const", tmp2, init_values["forest_values_p"] + level3_pairs[0][1]),
+            ],
+            valu=[
+                (
+                    "vbroadcast",
+                    level3_split_v[0],
+                    scalar_const_addrs[init_values["forest_values_p"] + level3_splits[0]],
+                )
+            ],
+        )
+        emit(
+            load=[
+                ("load", root_value, tmp1),
+                ("load", level1_diff, tmp2),
+            ],
+            valu=[
+                (
+                    "vbroadcast",
+                    level3_split_v[1],
+                    scalar_const_addrs[init_values["forest_values_p"] + level3_splits[1]],
+                )
+            ],
+        )
         for pair_i, (even_node, odd_node) in enumerate(level3_pairs):
-            emit(
-                load=[
-                    ("const", tmp1, init_values["forest_values_p"] + even_node),
-                    ("const", tmp2, init_values["forest_values_p"] + odd_node),
-                ]
+            next_pair = (
+                level3_pairs[pair_i + 1] if pair_i + 1 < len(level3_pairs) else None
             )
-            emit(
-                load=[
+            next_addr_loads = (
+                [
+                    ("const", tmp1, init_values["forest_values_p"] + next_pair[0]),
+                    ("const", tmp2, init_values["forest_values_p"] + next_pair[1]),
+                ]
+                if next_pair is not None
+                else []
+            )
+            next_node_loads = (
+                [
                     ("load", root_value, tmp1),
                     ("load", level1_diff, tmp2),
                 ]
+                if next_pair is not None
+                else []
             )
-            emit(
-                alu=[("-", level1_diff, level1_diff, root_value)],
-                valu=[("vbroadcast", level3_base_v[pair_i], root_value)],
-            )
-            emit(
-                valu=[("vbroadcast", level3_diff_v[pair_i], level1_diff)]
-            )
+            base_broadcasts = [("vbroadcast", level3_base_v[pair_i], root_value)]
+            if pair_i == 0:
+                base_broadcasts.append(
+                    (
+                        "vbroadcast",
+                        level3_split_v[2],
+                        scalar_const_addrs[
+                            init_values["forest_values_p"] + level3_splits[2]
+                        ],
+                    )
+                )
+            diff_broadcast = ("vbroadcast", level3_diff_v[pair_i], level1_diff)
+            if next_pair is None:
+                deferred_setup_ops.append(
+                    {
+                        "alu": [("-", level1_diff, level1_diff, root_value)],
+                        "valu": base_broadcasts,
+                    }
+                )
+                deferred_setup_ops.append({"valu": [diff_broadcast]})
+            else:
+                emit(
+                    load=next_addr_loads,
+                    alu=[("-", level1_diff, level1_diff, root_value)],
+                    valu=base_broadcasts,
+                )
+                emit(
+                    load=next_node_loads,
+                    valu=[diff_broadcast]
+                )
         while remaining_const_loads:
             emit(load=take_const_loads(SLOT_LIMITS["load"]))
 
+        pending_setup_ops = deferred_setup_ops
         setup_broadcasts = []
         early_hash_consts = {
             init_values["forest_values_p"] + 5,
@@ -678,6 +727,18 @@ class KernelBuilder:
                             if st["phase"] == "store_addr" and st["ready"] <= sched_cycle:
                                 st["phase"] = "store"
                                 st["ready"] = sched_cycle + 1
+
+                if pending_setup_ops:
+                    setup_op = pending_setup_ops[0]
+                    setup_alu = setup_op.get("alu", [])
+                    setup_valu = setup_op.get("valu", [])
+                    if (
+                        len(alu_slots) + len(setup_alu) <= SLOT_LIMITS["alu"]
+                        and len(valu_slots) + len(setup_valu) <= SLOT_LIMITS["valu"]
+                    ):
+                        alu_slots.extend(setup_alu)
+                        valu_slots.extend(setup_valu)
+                        pending_setup_ops.pop(0)
 
                 while pending_setup_broadcasts and len(valu_slots) < SLOT_LIMITS["valu"]:
                     valu_slots.append(pending_setup_broadcasts.pop(0))
