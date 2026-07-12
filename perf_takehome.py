@@ -79,6 +79,413 @@ class KernelBuilder:
             self.const_map[val] = self.alloc_scratch(name)
         return self.const_map[val]
 
+    def slot_rw(self, engine, slot):
+        reads = set()
+        writes = set()
+
+        def add_read(addr, length=1):
+            for i in range(length):
+                reads.add(addr + i)
+
+        def add_write(addr, length=1):
+            for i in range(length):
+                writes.add(addr + i)
+
+        op = slot[0]
+        if engine == "alu":
+            _, dest, a1, a2 = slot
+            add_read(a1)
+            add_read(a2)
+            add_write(dest)
+        elif engine == "valu":
+            if op == "vbroadcast":
+                _, dest, src = slot
+                add_read(src)
+                add_write(dest, VLEN)
+            elif op == "multiply_add":
+                _, dest, a, b, c = slot
+                add_read(a, VLEN)
+                add_read(b, VLEN)
+                add_read(c, VLEN)
+                add_write(dest, VLEN)
+            else:
+                _, dest, a1, a2 = slot
+                add_read(a1, VLEN)
+                add_read(a2, VLEN)
+                add_write(dest, VLEN)
+        elif engine == "load":
+            if op == "const":
+                _, dest, _val = slot
+                add_write(dest)
+            elif op == "load":
+                _, dest, addr = slot
+                add_read(addr)
+                add_write(dest)
+            elif op == "vload":
+                _, dest, addr = slot
+                add_read(addr)
+                add_write(dest, VLEN)
+            elif op == "load_offset":
+                _, dest, addr, offset = slot
+                add_read(addr + offset)
+                add_write(dest + offset)
+        elif engine == "store":
+            if op == "store":
+                _, addr, src = slot
+                add_read(addr)
+                add_read(src)
+            elif op == "vstore":
+                _, addr, src = slot
+                add_read(addr)
+                add_read(src, VLEN)
+        elif engine == "flow":
+            if op == "add_imm":
+                _, dest, addr, _imm = slot
+                add_read(addr)
+                add_write(dest)
+            elif op == "select":
+                _, dest, cond, a, b = slot
+                add_read(cond)
+                add_read(a)
+                add_read(b)
+                add_write(dest)
+            elif op == "vselect":
+                _, dest, cond, a, b = slot
+                add_read(cond, VLEN)
+                add_read(a, VLEN)
+                add_read(b, VLEN)
+                add_write(dest, VLEN)
+        return reads, writes
+
+    def schedule_segment(self, instrs):
+        ops = []
+        for instr in instrs:
+            for engine, slots in instr.items():
+                if engine == "debug":
+                    continue
+                for slot in slots:
+                    if engine == "flow" and slot[0] == "pause":
+                        continue
+                    ops.append((engine, slot))
+
+        reg_avail = defaultdict(int)
+        reg_last_read = defaultdict(lambda: -1)
+        reg_last_write = defaultdict(lambda: -1)
+        usage = defaultdict(lambda: defaultdict(int))
+        schedule = defaultdict(list)
+
+        for engine, slot in ops:
+            reads, writes = self.slot_rw(engine, slot)
+            cycle = 0
+            for addr in reads:
+                cycle = max(cycle, reg_avail[addr])
+            for addr in writes:
+                cycle = max(
+                    cycle,
+                    reg_last_read[addr],
+                    reg_last_write[addr] + 1,
+                )
+            while usage[cycle][engine] >= SLOT_LIMITS[engine]:
+                cycle += 1
+            schedule[cycle].append((engine, slot))
+            usage[cycle][engine] += 1
+
+            for addr in reads:
+                reg_last_read[addr] = max(reg_last_read[addr], cycle)
+            for addr in writes:
+                reg_avail[addr] = cycle + 1
+                reg_last_write[addr] = cycle
+
+        if not schedule:
+            return []
+        res = []
+        for cycle in range(max(schedule) + 1):
+            bundle = {}
+            for engine, slot in schedule[cycle]:
+                bundle.setdefault(engine, []).append(slot)
+            res.append(bundle)
+        return res
+
+    def schedule_segment_renamed(self, instrs):
+        ops = []
+        for instr in instrs:
+            for engine, slots in instr.items():
+                if engine == "debug":
+                    continue
+                for slot in slots:
+                    if engine == "flow" and slot[0] == "pause":
+                        continue
+                    ops.append((engine, slot))
+
+        vector_addrs = set()
+        for addr, (_name, length) in self.scratch_debug.items():
+            if length == VLEN:
+                vector_addrs.update(range(addr, addr + VLEN))
+
+        phys = list(range(SCRATCH_SIZE))
+        next_free = self.scratch_ptr
+
+        def mapped_vec_base(addr):
+            base = phys[addr]
+            for vi in range(VLEN):
+                if phys[addr + vi] != base + vi:
+                    raise AssertionError("Vector scratch mapping lost contiguity")
+            return base
+
+        def logical_rw(engine, slot):
+            op = slot[0]
+            reads = []
+            writes = []
+            if engine == "alu":
+                _, dest, a1, a2 = slot
+                reads = [("s", a1), ("s", a2)]
+                writes = [("s", dest)]
+            elif engine == "valu":
+                if op == "vbroadcast":
+                    _, dest, src = slot
+                    reads = [("s", src)]
+                    writes = [("v", dest)]
+                elif op == "multiply_add":
+                    _, dest, a, b, c = slot
+                    reads = [("v", a), ("v", b), ("v", c)]
+                    writes = [("v", dest)]
+                else:
+                    _, dest, a1, a2 = slot
+                    reads = [("v", a1), ("v", a2)]
+                    writes = [("v", dest)]
+            elif engine == "load":
+                if op == "const":
+                    _, dest, _val = slot
+                    writes = [("s", dest)]
+                elif op == "load":
+                    _, dest, addr = slot
+                    reads = [("s", addr)]
+                    writes = [("s", dest)]
+                elif op == "vload":
+                    _, dest, addr = slot
+                    reads = [("s", addr)]
+                    writes = [("v", dest)]
+                elif op == "load_offset":
+                    _, dest, addr, offset = slot
+                    reads = [("lane", addr, offset)]
+                    writes = [("lane", dest, offset)]
+            elif engine == "store":
+                if op == "store":
+                    _, addr, src = slot
+                    reads = [("s", addr), ("s", src)]
+                elif op == "vstore":
+                    _, addr, src = slot
+                    reads = [("s", addr), ("v", src)]
+            elif engine == "flow":
+                if op == "add_imm":
+                    _, dest, addr, _imm = slot
+                    reads = [("s", addr)]
+                    writes = [("s", dest)]
+                elif op == "select":
+                    _, dest, cond, a, b = slot
+                    reads = [("s", cond), ("s", a), ("s", b)]
+                    writes = [("s", dest)]
+                elif op == "vselect":
+                    _, dest, cond, a, b = slot
+                    reads = [("v", cond), ("v", a), ("v", b)]
+                    writes = [("v", dest)]
+            return reads, writes
+
+        def phys_reads(items):
+            res = []
+            for item in items:
+                if item[0] == "s":
+                    res.append(phys[item[1]])
+                elif item[0] == "v":
+                    base = mapped_vec_base(item[1])
+                    res.extend(range(base, base + VLEN))
+                elif item[0] == "lane":
+                    res.append(phys[item[1] + item[2]])
+            return res
+
+        def alloc_words(count):
+            nonlocal next_free
+            rename_limit = min(SCRATCH_SIZE, self.scratch_ptr + 3)
+            if next_free + count > rename_limit:
+                return None
+            addr = next_free
+            next_free += count
+            return addr
+
+        def rewrite_slot(engine, slot):
+            op = slot[0]
+            if engine == "alu":
+                _, dest, a1, a2 = slot
+                return (op, phys[dest], phys[a1], phys[a2])
+            if engine == "valu":
+                if op == "vbroadcast":
+                    _, dest, src = slot
+                    return (op, mapped_vec_base(dest), phys[src])
+                if op == "multiply_add":
+                    _, dest, a, b, c = slot
+                    return (
+                        op,
+                        mapped_vec_base(dest),
+                        mapped_vec_base(a),
+                        mapped_vec_base(b),
+                        mapped_vec_base(c),
+                    )
+                _, dest, a1, a2 = slot
+                return (op, mapped_vec_base(dest), mapped_vec_base(a1), mapped_vec_base(a2))
+            if engine == "load":
+                if op == "const":
+                    _, dest, val = slot
+                    return (op, phys[dest], val)
+                if op == "load":
+                    _, dest, addr = slot
+                    return (op, phys[dest], phys[addr])
+                if op == "vload":
+                    _, dest, addr = slot
+                    return (op, mapped_vec_base(dest), phys[addr])
+                if op == "load_offset":
+                    _, dest, addr, offset = slot
+                    return (op, mapped_vec_base(dest), mapped_vec_base(addr), offset)
+            if engine == "store":
+                if op == "store":
+                    _, addr, src = slot
+                    return (op, phys[addr], phys[src])
+                if op == "vstore":
+                    _, addr, src = slot
+                    return (op, phys[addr], mapped_vec_base(src))
+            if engine == "flow":
+                if op == "add_imm":
+                    _, dest, addr, imm = slot
+                    return (op, phys[dest], phys[addr], imm)
+                if op == "select":
+                    _, dest, cond, a, b = slot
+                    return (op, phys[dest], phys[cond], phys[a], phys[b])
+                if op == "vselect":
+                    _, dest, cond, a, b = slot
+                    return (
+                        op,
+                        mapped_vec_base(dest),
+                        mapped_vec_base(cond),
+                        mapped_vec_base(a),
+                        mapped_vec_base(b),
+                    )
+            return slot
+
+        reg_avail = defaultdict(int)
+        reg_last_read = defaultdict(lambda: -1)
+        reg_last_write = defaultdict(lambda: -1)
+        usage = defaultdict(lambda: defaultdict(int))
+        schedule = defaultdict(list)
+
+        for engine, slot in ops:
+            reads, writes = logical_rw(engine, slot)
+            cycle = 0
+            for addr in phys_reads(reads):
+                cycle = max(cycle, reg_avail[addr])
+
+            while True:
+                while usage[cycle][engine] >= SLOT_LIMITS[engine]:
+                    cycle += 1
+
+                delayed_cycle = cycle
+                allocations = []
+                for write in writes:
+                    if write[0] == "v":
+                        logical = write[1]
+                        current = mapped_vec_base(logical)
+                        conflicts = any(
+                            max(
+                                reg_last_read[current + vi],
+                                reg_last_write[current + vi] + 1,
+                            )
+                            > cycle
+                            for vi in range(VLEN)
+                        )
+                        if conflicts:
+                            renamed = alloc_words(VLEN)
+                            if renamed is not None:
+                                allocations.append((write, renamed))
+                                continue
+                        for vi in range(VLEN):
+                            delayed_cycle = max(
+                                delayed_cycle,
+                                reg_last_read[current + vi],
+                                reg_last_write[current + vi] + 1,
+                            )
+                    elif write[0] == "s":
+                        logical = write[1]
+                        current = phys[logical]
+                        conflict_cycle = max(
+                            reg_last_read[current],
+                            reg_last_write[current] + 1,
+                        )
+                        if conflict_cycle > cycle and logical not in vector_addrs:
+                            renamed = alloc_words(1)
+                            if renamed is not None:
+                                allocations.append((write, renamed))
+                                continue
+                        delayed_cycle = max(delayed_cycle, conflict_cycle)
+                    elif write[0] == "lane":
+                        current = phys[write[1] + write[2]]
+                        delayed_cycle = max(
+                            delayed_cycle,
+                            reg_last_read[current],
+                            reg_last_write[current] + 1,
+                        )
+
+                if allocations:
+                    for write, renamed in allocations:
+                        if write[0] == "v":
+                            for vi in range(VLEN):
+                                phys[write[1] + vi] = renamed + vi
+                        elif write[0] == "s":
+                            phys[write[1]] = renamed
+                    break
+                if delayed_cycle > cycle:
+                    cycle = delayed_cycle
+                    continue
+                break
+
+            rewritten = rewrite_slot(engine, slot)
+            schedule[cycle].append((engine, rewritten))
+            usage[cycle][engine] += 1
+
+            reads, writes = self.slot_rw(engine, rewritten)
+            for addr in reads:
+                reg_last_read[addr] = max(reg_last_read[addr], cycle)
+            for addr in writes:
+                reg_avail[addr] = cycle + 1
+                reg_last_write[addr] = cycle
+
+        self.scratch_ptr = max(self.scratch_ptr, next_free)
+        if not schedule:
+            return []
+        res = []
+        for cycle in range(max(schedule) + 1):
+            bundle = {}
+            for engine, slot in schedule[cycle]:
+                bundle.setdefault(engine, []).append(slot)
+            res.append(bundle)
+        return res
+
+    def optimize_schedule(self):
+        pause_idxs = [
+            i
+            for i, instr in enumerate(self.instrs)
+            if any(
+                engine == "flow" and any(slot[0] == "pause" for slot in slots)
+                for engine, slots in instr.items()
+            )
+        ]
+        if len(pause_idxs) < 2:
+            return
+        first_pause = pause_idxs[0]
+        final_pause = pause_idxs[-1]
+        self.instrs = (
+            self.instrs[: first_pause + 1]
+            + self.schedule_segment_renamed(self.instrs[first_pause + 1 : final_pause])
+            + self.instrs[final_pause:]
+        )
+
     def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
         slots = []
 
@@ -155,9 +562,29 @@ class KernelBuilder:
         val = [self.alloc_scratch(f"val{g}", VLEN) for g in range(max_groups)]
         addr = [self.alloc_scratch(f"addr{g}", VLEN) for g in range(max_groups)]
         tmpa = [self.alloc_scratch(f"tmpa{g}", VLEN) for g in range(max_groups)]
-        tmpb_pool_size = 18
+        tmpb_pool_size = 13
         tmpb = [self.alloc_scratch(f"tmpb{i}", VLEN) for i in range(tmpb_pool_size)]
         store_ptr = [self.alloc_scratch(f"store_ptr{g}") for g in range(max_groups)]
+        preloaded_value_count = 0
+
+        def fill_setup_preloads(loads):
+            nonlocal preloaded_value_count
+            loads = list(loads)
+            while (
+                setup_phase
+                and preloaded_value_count < min(max_groups, 2)
+                and len(loads) < SLOT_LIMITS["load"]
+            ):
+                loads.append(
+                    (
+                        "vload",
+                        val[preloaded_value_count],
+                        store_ptr[preloaded_value_count],
+                    )
+                )
+                preloaded_value_count += 1
+            return loads
+
         setup_flow_slots = [
             ("add_imm", store_ptr[g], self.scratch["inp_values_p"], g * VLEN)
             for g in range(max_groups)
@@ -168,7 +595,6 @@ class KernelBuilder:
         root_child_base_v = self.alloc_scratch("root_child_base_v", VLEN)
         addr_update_const_v = self.alloc_scratch("addr_update_const_v", VLEN)
         addr_update_odd_v = self.alloc_scratch("addr_update_odd_v", VLEN)
-        root_value = self.alloc_scratch("root_value")
         root_value_v = self.alloc_scratch("root_value_v", VLEN)
         level1_diff = self.alloc_scratch("level1_diff")
         level1_right_v = self.alloc_scratch("level1_right_v", VLEN)
@@ -179,16 +605,13 @@ class KernelBuilder:
         level2_diff_v = [
             self.alloc_scratch(f"level2_diff_v{i}", VLEN) for i in range(2)
         ]
-        level2_split_v = self.alloc_scratch("level2_split_v", VLEN)
         level3_base_v = [
             self.alloc_scratch(f"level3_base_v{i}", VLEN) for i in range(4)
         ]
         level3_diff_v = [
             self.alloc_scratch(f"level3_diff_v{i}", VLEN) for i in range(4)
         ]
-        level3_split_v = [
-            self.alloc_scratch(f"level3_split_v{i}", VLEN) for i in range(3)
-        ]
+        level3_split_v = self.alloc_scratch("level3_split_v1", VLEN)
         hash_const_v = {}
         hash_mult_v = {}
         for op1, _val1, op2, op3, val3 in HASH_STAGES:
@@ -202,20 +625,20 @@ class KernelBuilder:
                 needed.append(val3)
             for c in needed:
                 if c not in hash_const_v:
-                    hash_const_v[c] = self.alloc_scratch(f"hash_const_{c:x}", VLEN)
-
+                    if c in hash_mult_v:
+                        hash_const_v[c] = hash_mult_v[c]
+                    else:
+                        hash_const_v[c] = self.alloc_scratch(f"hash_const_{c:x}", VLEN)
         scalar_const_values = [
             1,
             2,
             init_values["forest_values_p"] + 1,
             1 - init_values["forest_values_p"],
             2 - init_values["forest_values_p"],
-            init_values["forest_values_p"] + 5,
             *hash_const_v.keys(),
             *hash_mult_v.keys(),
-            init_values["forest_values_p"] + 9,
+            init_values["forest_values_p"] + 8,
             init_values["forest_values_p"] + 11,
-            init_values["forest_values_p"] + 13,
         ]
         scalar_const_addrs = {}
         scalar_const_loads = []
@@ -227,15 +650,17 @@ class KernelBuilder:
             scalar_const_loads.append(("const", addr_c, c))
         one_const = scalar_const_addrs[1]
         two_const = scalar_const_addrs[2]
+        setup_nodes_low = tmpa[0]
+        setup_nodes_high = tmpa[1]
 
         early_const_values = {
             1,
             2,
             init_values["forest_values_p"] + 1,
+            init_values["forest_values_p"] + 8,
             1 - init_values["forest_values_p"],
             2 - init_values["forest_values_p"],
             init_values["forest_values_p"] + 11,
-            init_values["forest_values_p"] + 13,
         }
         remaining_const_loads = [
             ("const", scalar_const_addrs[c], c)
@@ -256,7 +681,7 @@ class KernelBuilder:
 
         emit(
             load=[
-                ("load", root_value, self.scratch["forest_values_p"]),
+                ("vload", setup_nodes_low, self.scratch["forest_values_p"]),
                 ("const", one_const, 1),
             ]
         )
@@ -285,10 +710,13 @@ class KernelBuilder:
             ]
         )
         emit(
-            load=[
-                ("const", tmp1, init_values["forest_values_p"] + 1),
-                ("const", tmp2, init_values["forest_values_p"] + 2),
-            ],
+            load=fill_setup_preloads([
+                (
+                    "const",
+                    scalar_const_addrs[init_values["forest_values_p"] + 8],
+                    init_values["forest_values_p"] + 8,
+                ),
+            ]),
             valu=[
                 ("vbroadcast", one_v, one_const),
                 ("vbroadcast", two_v, two_const),
@@ -307,39 +735,27 @@ class KernelBuilder:
                     addr_update_odd_v,
                     scalar_const_addrs[2 - init_values["forest_values_p"]],
                 ),
-                ("vbroadcast", root_value_v, root_value),
-            ]
-        )
-        emit(
-            load=[
-                ("load", root_value, tmp1),
-                ("load", level1_diff, tmp2),
+                ("vbroadcast", root_value_v, setup_nodes_low),
             ]
         )
         emit(
             load=take_const_loads(2),
-            alu=[("-", level1_diff, level1_diff, root_value)],
-            valu=[("vbroadcast", level1_right_v, root_value)],
+            alu=[("-", level1_diff, setup_nodes_low + 2, setup_nodes_low + 1)],
+            valu=[("vbroadcast", level1_right_v, setup_nodes_low + 1)],
         )
         emit(
             load=take_const_loads(2),
             valu=[
                 ("vbroadcast", level1_diff_v, level1_diff),
-                (
-                    "vbroadcast",
-                    level2_split_v,
-                    scalar_const_addrs[init_values["forest_values_p"] + 5],
-                ),
                 ("vbroadcast", hash_const_v[0x7ED55D16], scalar_const_addrs[0x7ED55D16]),
             ],
         )
         level2_pairs = [(3, 4), (5, 6)]
         for pair_i, (left_node, right_node) in enumerate(level2_pairs):
+            left_lane = setup_nodes_low + left_node
+            right_lane = left_lane + 1
             emit(
-                load=[
-                    ("const", tmp1, init_values["forest_values_p"] + left_node),
-                    ("const", tmp2, init_values["forest_values_p"] + right_node),
-                ],
+                load=fill_setup_preloads([]),
                 valu=(
                     [
                         (
@@ -361,20 +777,14 @@ class KernelBuilder:
                 ),
             )
             emit(
-                load=[
-                    ("load", root_value, tmp1),
-                    ("load", level1_diff, tmp2),
-                ]
-            )
-            emit(
                 load=take_const_loads(2),
-                alu=[("-", root_value, level1_diff, root_value)],
-                valu=[("vbroadcast", level2_right_v[pair_i], root_value)],
+                alu=[("-", level1_diff, right_lane, left_lane)],
+                valu=[("vbroadcast", level2_right_v[pair_i], left_lane)],
             )
             emit(
                 load=take_const_loads(2),
                 valu=[
-                    ("vbroadcast", level2_diff_v[pair_i], root_value),
+                    ("vbroadcast", level2_diff_v[pair_i], level1_diff),
                     *(
                         [
                             (
@@ -400,107 +810,74 @@ class KernelBuilder:
                     ),
                     *(
                         [("vbroadcast", hash_mult_v[9], scalar_const_addrs[9])]
-                        if pair_i == 1 and 9 in hash_mult_v
+                        if (
+                            pair_i == 1
+                            and 9 in hash_mult_v
+                            and hash_const_v.get(9) != hash_mult_v[9]
+                        )
                         else []
                     ),
                 ]
             )
         emit(
-            load=[
+            load=fill_setup_preloads([
                 (
                     "const",
                     scalar_const_addrs[init_values["forest_values_p"] + 11],
                     init_values["forest_values_p"] + 11,
                 ),
-                (
-                    "const",
-                    scalar_const_addrs[init_values["forest_values_p"] + 13],
-                    init_values["forest_values_p"] + 13,
-                ),
-            ]
+            ]),
         )
         level3_pairs = [(7, 8), (9, 10), (11, 12), (13, 14)]
-        level3_splits = (9, 11, 13)
         deferred_setup_ops = []
         emit(
-            load=[
-                ("const", tmp1, init_values["forest_values_p"] + level3_pairs[0][0]),
-                ("const", tmp2, init_values["forest_values_p"] + level3_pairs[0][1]),
-            ],
+            load=fill_setup_preloads([
+                (
+                    "vload",
+                    setup_nodes_high,
+                    scalar_const_addrs[init_values["forest_values_p"] + 8],
+                ),
+            ]),
             valu=[
                 (
                     "vbroadcast",
-                    level3_split_v[0],
-                    scalar_const_addrs[init_values["forest_values_p"] + level3_splits[0]],
-                )
-            ],
-        )
-        emit(
-            load=[
-                ("load", root_value, tmp1),
-                ("load", level1_diff, tmp2),
-            ],
-            valu=[
-                (
-                    "vbroadcast",
-                    level3_split_v[1],
-                    scalar_const_addrs[init_values["forest_values_p"] + level3_splits[1]],
-                )
+                    level3_split_v,
+                    scalar_const_addrs[init_values["forest_values_p"] + 11],
+                ),
             ],
         )
         for pair_i, (even_node, odd_node) in enumerate(level3_pairs):
+            if pair_i == 0:
+                even_src = setup_nodes_low + 7
+                odd_src = setup_nodes_high
+            else:
+                even_src = setup_nodes_high + pair_i * 2 - 1
+                odd_src = even_src + 1
             next_pair = (
                 level3_pairs[pair_i + 1] if pair_i + 1 < len(level3_pairs) else None
             )
-            next_addr_loads = (
-                [
-                    ("const", tmp1, init_values["forest_values_p"] + next_pair[0]),
-                    ("const", tmp2, init_values["forest_values_p"] + next_pair[1]),
-                ]
-                if next_pair is not None
-                else []
-            )
-            next_node_loads = (
-                [
-                    ("load", root_value, tmp1),
-                    ("load", level1_diff, tmp2),
-                ]
-                if next_pair is not None
-                else []
-            )
-            base_broadcasts = [("vbroadcast", level3_base_v[pair_i], root_value)]
-            if pair_i == 0:
-                base_broadcasts.append(
-                    (
-                        "vbroadcast",
-                        level3_split_v[2],
-                        scalar_const_addrs[
-                            init_values["forest_values_p"] + level3_splits[2]
-                        ],
-                    )
-                )
+            base_broadcasts = [("vbroadcast", level3_base_v[pair_i], even_src)]
             diff_broadcast = ("vbroadcast", level3_diff_v[pair_i], level1_diff)
             if next_pair is None:
                 deferred_setup_ops.append(
                     {
-                        "alu": [("-", level1_diff, level1_diff, root_value)],
+                        "alu": [("-", level1_diff, odd_src, even_src)],
                         "valu": base_broadcasts,
                     }
                 )
                 deferred_setup_ops.append({"valu": [diff_broadcast]})
             else:
                 emit(
-                    load=next_addr_loads,
-                    alu=[("-", level1_diff, level1_diff, root_value)],
+                    load=fill_setup_preloads(take_const_loads(2)),
+                    alu=[("-", level1_diff, odd_src, even_src)],
                     valu=base_broadcasts,
                 )
                 emit(
-                    load=next_node_loads,
+                    load=fill_setup_preloads(take_const_loads(2)),
                     valu=[diff_broadcast]
                 )
         while remaining_const_loads:
-            emit(load=take_const_loads(SLOT_LIMITS["load"]))
-
+            emit(load=fill_setup_preloads(take_const_loads(SLOT_LIMITS["load"])))
         pending_setup_ops = deferred_setup_ops
         setup_broadcasts = []
         early_hash_consts = {
@@ -540,7 +917,6 @@ class KernelBuilder:
                     "ready": 0,
                     "off": 0,
                     "base_ready": False,
-                    "zero_ready": False,
                     "store_ready": False,
                     "tmpb_slot": None,
                     "tmpb_slot2": None,
@@ -552,18 +928,17 @@ class KernelBuilder:
                 states[g]["ready"] = ready_cycle
                 states[g]["off"] = 0
                 states[g]["base_ready"] = False
-                states[g]["zero_ready"] = False
                 if states[g]["round"] >= rounds:
                     states[g]["phase"] = "store" if states[g]["store_ready"] else "store_addr"
                 elif use_level3_cache and (
                     states[g]["round"] in level3_rounds
                     or (
                         states[g]["round"] == 14
-                        and g in level3_round14_groups
+                        and (block_start + g) in level3_round14_groups
                     )
                     or (
                         states[g]["round"] == 3
-                        and g in level3_round3_groups
+                        and (block_start + g) in level3_round3_groups
                     )
                 ):
                     states[g]["phase"] = "addr"
@@ -573,18 +948,38 @@ class KernelBuilder:
                     states[g]["phase"] = "addr"
 
             sched_cycle = 0
-            init_load_pair = 0
-            next_init_ptr = precomputed_store_ptr_count
+            active_precomputed_store_ptr_count = (
+                precomputed_store_ptr_count if block_start == 0 else 0
+            )
+            init_load_pair = (
+                min(preloaded_value_count, group_count) if block_start == 0 else 0
+            )
+            next_init_ptr = active_precomputed_store_ptr_count
             ptr_ready = [
-                0 if g < precomputed_store_ptr_count else 10**9
+                0 if g < active_precomputed_store_ptr_count else 10**9
                 for g in range(group_count)
             ]
-            for g in range(min(precomputed_store_ptr_count, group_count)):
+            for g in range(min(active_precomputed_store_ptr_count, group_count)):
                 states[g]["store_ready"] = True
+            for g in range(init_load_pair):
+                states[g]["store_ready"] = True
+                states[g]["phase"] = "addr"
+                states[g]["ready"] = 0
             while any(st["phase"] != "done" for st in states):
                 done_count = sum(st["phase"] == "done" for st in states)
                 if done_count >= 19:
-                    load_scan_order = list(range(group_count - 1, -1, -1))
+                    tail_load_priority_global = (30, 31, 27, 29, 28)
+                    tail_load_priority = [
+                        gg - block_start
+                        for gg in tail_load_priority_global
+                        if block_start <= gg < block_start + group_count
+                    ]
+                    tail_load_set = set(tail_load_priority)
+                    load_scan_order = tail_load_priority + [
+                        g
+                        for g in range(group_count - 1, -1, -1)
+                        if g not in tail_load_set
+                    ]
                 else:
                     load_scan_order = list(range(group_count))
                 if done_count >= 0:
@@ -694,14 +1089,17 @@ class KernelBuilder:
                         st = states[g]
                         if len(load_slots) >= SLOT_LIMITS["load"]:
                             break
-                        if st["phase"] == "gather" and st["ready"] <= sched_cycle:
+                        while (
+                            done_count >= 20
+                            and len(load_slots) < SLOT_LIMITS["load"]
+                            and st["phase"] == "gather"
+                            and st["ready"] <= sched_cycle
+                        ):
                             load_slots.append(("load_offset", addr[g], idx[g], st["off"]))
                             st["off"] += 1
                             if st["off"] == VLEN:
                                 st["phase"] = "xor"
                                 st["ready"] = sched_cycle + 1
-                    for g in load_scan_order:
-                        st = states[g]
                         if len(load_slots) >= SLOT_LIMITS["load"]:
                             break
                         if st["phase"] == "gather" and st["ready"] <= sched_cycle:
@@ -710,6 +1108,17 @@ class KernelBuilder:
                             if st["off"] == VLEN:
                                 st["phase"] = "xor"
                                 st["ready"] = sched_cycle + 1
+                    if done_count < 20:
+                        for g in load_scan_order:
+                            st = states[g]
+                            if len(load_slots) >= SLOT_LIMITS["load"]:
+                                break
+                            if st["phase"] == "gather" and st["ready"] <= sched_cycle:
+                                load_slots.append(("load_offset", addr[g], idx[g], st["off"]))
+                                st["off"] += 1
+                                if st["off"] == VLEN:
+                                    st["phase"] = "xor"
+                                    st["ready"] = sched_cycle + 1
                     for g in load_scan_order:
                         st = states[g]
                         if len(load_slots) >= SLOT_LIMITS["load"]:
@@ -880,7 +1289,7 @@ class KernelBuilder:
                             elif r + 1 >= rounds:
                                 advance_after_update(g, sched_cycle + 1)
                             elif (r + 1) % (forest_height + 1) == 0:
-                                if st["zero_ready"]:
+                                if done_count >= 13:
                                     advance_after_update(g, sched_cycle + 1)
                                 else:
                                     st["phase"] = "zero"
@@ -940,8 +1349,8 @@ class KernelBuilder:
                             st["phase"] = "level2_pair1"
                         elif use_level3_cache and (
                             r in level3_rounds
-                            or (r == 14 and g in level3_round14_groups)
-                            or (r == 3 and g in level3_round3_groups)
+                            or (r == 14 and (block_start + g) in level3_round14_groups)
+                            or (r == 3 and (block_start + g) in level3_round3_groups)
                         ):
                             slots = alloc_two_tmpb_slots()
                             if slots is None:
@@ -969,14 +1378,6 @@ class KernelBuilder:
                                 ("multiply_add", addr[g], idx[g], two_v, addr_update_const_v)
                             )
                             st["base_ready"] = True
-                        if (
-                            r + 1 < rounds
-                            and (r + 1) % (forest_height + 1) == 0
-                            and done_count >= 19
-                            and len(valu_slots) <= 3
-                        ):
-                            if add_simple_vec("^", idx[g], idx[g], idx[g]):
-                                st["zero_ready"] = True
                         st["phase"] = "hash_pre"
                         st["hash_i"] = 0
                         st["ready"] = sched_cycle + 1
@@ -1020,7 +1421,7 @@ class KernelBuilder:
                         st["phase"] = "level2_cmp"
                         st["ready"] = sched_cycle + 1
                     elif phase == "level2_cmp":
-                        if not add_simple_vec("<", tmpa[g], idx[g], level2_split_v):
+                        if not add_simple_vec("&", tmpa[g], idx[g], two_v):
                             break
                         st["phase"] = "level2_select_flow"
                         st["ready"] = sched_cycle + 1
@@ -1055,7 +1456,7 @@ class KernelBuilder:
                         st["phase"] = "level3_cmp01"
                         st["ready"] = sched_cycle + 1
                     elif phase == "level3_cmp01":
-                        if not add_simple_vec("<", tmpa[g], idx[g], level3_split_v[0]):
+                        if not add_simple_vec("&", tmpa[g], idx[g], two_v):
                             break
                         st["phase"] = "level3_select01_flow"
                         st["ready"] = sched_cycle + 1
@@ -1087,12 +1488,12 @@ class KernelBuilder:
                         st["phase"] = "level3_cmp23"
                         st["ready"] = sched_cycle + 1
                     elif phase == "level3_cmp23":
-                        if not add_simple_vec("<", tmpa[g], idx[g], level3_split_v[2]):
+                        if not add_simple_vec("&", tmpa[g], idx[g], two_v):
                             break
                         st["phase"] = "level3_select23_flow"
                         st["ready"] = sched_cycle + 1
                     elif phase == "level3_final_cmp":
-                        if not add_simple_vec("<", tmpa[g], idx[g], level3_split_v[1]):
+                        if not add_simple_vec("<", tmpa[g], idx[g], level3_split_v):
                             break
                         st["phase"] = "level3_final_select_flow"
                         st["ready"] = sched_cycle + 1
@@ -1113,7 +1514,7 @@ class KernelBuilder:
                             advance_after_update(g, sched_cycle + 1)
                         elif (r + 1) % (forest_height + 1) == 0:
                             st["tmpb_slot"] = None
-                            if st["zero_ready"]:
+                            if done_count >= 13:
                                 advance_after_update(g, sched_cycle + 1)
                             else:
                                 st["phase"] = "zero"
@@ -1188,6 +1589,7 @@ class KernelBuilder:
             self.instrs[-1]["flow"] = [("pause",)]
         else:
             self.instrs.append({"flow": [("pause",)]})
+        self.optimize_schedule()
 
 BASELINE = 147734
 
