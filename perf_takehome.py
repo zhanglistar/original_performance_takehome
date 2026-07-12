@@ -38,6 +38,16 @@ from problem import (
 
 
 class KernelBuilder:
+    simple_valu_first_limit = 4
+    simple_valu_first_done_threshold = 0
+    base_ready_done_threshold = 21
+    base_ready_valu_limit = 4
+    hash_half_alu_done_threshold = 18
+    level3_round3_groups = {2, 20, 21, 22, 25, 26, 29, 30, 31}
+    level3_round14_groups = set(range(32)) - {28, 29, 30, 31}
+    tail_load_priority = (30, 31, 27, 29, 28)
+    double_gather_done_threshold = 20
+
     def __init__(self):
         self.instrs = []
         self.scratch = {}
@@ -556,11 +566,11 @@ class KernelBuilder:
         max_groups = n_vec_groups
         use_level3_cache = True
         level3_rounds = set()
-        level3_round3_groups = {2, 20, 21, 22, 25, 26, 29, 30, 31}
-        level3_round14_groups = set(range(max_groups)) - {27, 28, 29, 30, 31}
-        base_ready_done_threshold = 19
-        base_ready_valu_limit = 4
-        hash_half_alu_done_threshold = 18
+        level3_round3_groups = set(self.level3_round3_groups)
+        level3_round14_groups = set(self.level3_round14_groups)
+        base_ready_done_threshold = self.base_ready_done_threshold
+        base_ready_valu_limit = self.base_ready_valu_limit
+        hash_half_alu_done_threshold = self.hash_half_alu_done_threshold
         zero_skip_done_threshold = 13
         idx = [self.alloc_scratch(f"idx{g}", VLEN) for g in range(max_groups)]
         val = [self.alloc_scratch(f"val{g}", VLEN) for g in range(max_groups)]
@@ -633,6 +643,20 @@ class KernelBuilder:
                         hash_const_v[c] = hash_mult_v[c]
                     else:
                         hash_const_v[c] = self.alloc_scratch(f"hash_const_{c:x}", VLEN)
+
+        # Fuse hash stages 2 and 3.  With 32-bit wrapping arithmetic:
+        #   y = 33*x + c2
+        #   z = (y + c3) ^ (y << 9)
+        #     = (33*x + c2 + c3) ^ ((33 << 9)*x + (c2 << 9))
+        # This replaces four vector operations with three for every hash.
+        hash23_mult_lo = 33
+        hash23_mult_hi = 33 << 9
+        hash23_const_lo = (HASH_STAGES[2][1] + HASH_STAGES[3][1]) % (2**32)
+        hash23_const_hi = (HASH_STAGES[2][1] << 9) % (2**32)
+        hash23_mult_lo_v = hash_mult_v[hash23_mult_lo]
+        hash23_mult_hi_v = self.alloc_scratch("hash23_mult_hi", VLEN)
+        hash23_const_lo_v = self.alloc_scratch("hash23_const_lo", VLEN)
+        hash23_const_hi_v = self.alloc_scratch("hash23_const_hi", VLEN)
         scalar_const_values = [
             1,
             2,
@@ -643,6 +667,9 @@ class KernelBuilder:
             *hash_mult_v.keys(),
             init_values["forest_values_p"] + 8,
             init_values["forest_values_p"] + 11,
+            hash23_mult_hi,
+            hash23_const_lo,
+            hash23_const_hi,
         ]
         scalar_const_addrs = {}
         scalar_const_loads = []
@@ -906,6 +933,13 @@ class KernelBuilder:
             for c, vec in hash_mult_v.items()
             if c != 9
         )
+        setup_broadcasts.extend(
+            [
+                ("vbroadcast", hash23_mult_hi_v, scalar_const_addrs[hash23_mult_hi]),
+                ("vbroadcast", hash23_const_lo_v, scalar_const_addrs[hash23_const_lo]),
+                ("vbroadcast", hash23_const_hi_v, scalar_const_addrs[hash23_const_hi]),
+            ]
+        )
         pending_setup_broadcasts = setup_broadcasts
 
         precomputed_store_ptr_count = max_groups - len(setup_flow_slots)
@@ -972,7 +1006,7 @@ class KernelBuilder:
             while any(st["phase"] != "done" for st in states):
                 done_count = sum(st["phase"] == "done" for st in states)
                 if done_count >= 19:
-                    tail_load_priority_global = (30, 31, 27, 29, 28)
+                    tail_load_priority_global = self.tail_load_priority
                     tail_load_priority = [
                         gg - block_start
                         for gg in tail_load_priority_global
@@ -1026,6 +1060,12 @@ class KernelBuilder:
                     return True
 
                 def add_simple_vec(op, dest, a1, a2):
+                    if (
+                        done_count >= self.simple_valu_first_done_threshold
+                        and len(valu_slots) <= self.simple_valu_first_limit
+                    ):
+                        valu_slots.append((op, dest, a1, a2))
+                        return True
                     # Prefer ALU for simple ops so VALU stays free for multiply_add.
                     # ALU has 12 slots but VLEN=8, so at most one spilled vector/cycle
                     # (alu-8..11 stay idle — can't fit another full vector).
@@ -1119,7 +1159,7 @@ class KernelBuilder:
                         if len(load_slots) >= SLOT_LIMITS["load"]:
                             break
                         while (
-                            done_count >= 20
+                            done_count >= self.double_gather_done_threshold
                             and len(load_slots) < SLOT_LIMITS["load"]
                             and st["phase"] == "gather"
                             and st["ready"] <= sched_cycle
@@ -1137,7 +1177,7 @@ class KernelBuilder:
                             if st["off"] == VLEN:
                                 st["phase"] = "xor"
                                 st["ready"] = sched_cycle + 1
-                    if done_count < 20:
+                    if done_count < self.double_gather_done_threshold:
                         for g in load_scan_order:
                             st = states[g]
                             if len(load_slots) >= SLOT_LIMITS["load"]:
@@ -1299,6 +1339,31 @@ class KernelBuilder:
                         hash_tmp = tmpb[tmpb_slot]
                         hi = st["hash_i"]
                         op1, val1, _op2, op3, val3 = HASH_STAGES[hi]
+                        if hi == 2:
+                            if len(valu_slots) + 2 > SLOT_LIMITS["valu"]:
+                                continue
+                            valu_slots.append(
+                                (
+                                    "multiply_add",
+                                    tmpa[g],
+                                    val[g],
+                                    hash23_mult_lo_v,
+                                    hash23_const_lo_v,
+                                )
+                            )
+                            valu_slots.append(
+                                (
+                                    "multiply_add",
+                                    hash_tmp,
+                                    val[g],
+                                    hash23_mult_hi_v,
+                                    hash23_const_hi_v,
+                                )
+                            )
+                            st["phase"] = "hash_combine"
+                            maybe_add_base_ready(g, st, r)
+                            st["ready"] = sched_cycle + 1
+                            continue
                         if (op1, _op2, op3) == ("+", "+", "<<"):
                             if len(valu_slots) >= SLOT_LIMITS["valu"]:
                                 break
@@ -1532,9 +1597,11 @@ class KernelBuilder:
                         hash_tmp = tmpb[tmpb_slot]
                         hi = st["hash_i"]
                         _op1, _val1, op2, _op3, _val3 = HASH_STAGES[hi]
+                        if hi == 2:
+                            op2 = "^"
                         if not add_simple_vec(op2, val[g], tmpa[g], hash_tmp):
                             break
-                        st["hash_i"] += 1
+                        st["hash_i"] += 2 if hi == 2 else 1
                         if st["hash_i"] < len(HASH_STAGES):
                             st["phase"] = "hash_pre"
                         elif r + 1 >= rounds:
