@@ -558,6 +558,10 @@ class KernelBuilder:
         level3_rounds = set()
         level3_round3_groups = {2, 20, 21, 22, 25, 26, 29, 30, 31}
         level3_round14_groups = set(range(max_groups)) - {27, 28, 29, 30, 31}
+        base_ready_done_threshold = 19
+        base_ready_valu_limit = 4
+        hash_half_alu_done_threshold = 18
+        zero_skip_done_threshold = 13
         idx = [self.alloc_scratch(f"idx{g}", VLEN) for g in range(max_groups)]
         val = [self.alloc_scratch(f"val{g}", VLEN) for g in range(max_groups)]
         addr = [self.alloc_scratch(f"addr{g}", VLEN) for g in range(max_groups)]
@@ -1010,6 +1014,17 @@ class KernelBuilder:
                     )
                     return True
 
+                def add_alu_vec_lanes(op, dest, a1, a2, start, count):
+                    if op not in ("+", "-", "^", "&", "<<", ">>", "<"):
+                        return False
+                    if len(alu_slots) + count > SLOT_LIMITS["alu"]:
+                        return False
+                    alu_slots.extend(
+                        (op, dest + vi, a1 + vi, a2 + vi)
+                        for vi in range(start, start + count)
+                    )
+                    return True
+
                 def add_simple_vec(op, dest, a1, a2):
                     # Prefer ALU for simple ops so VALU stays free for multiply_add.
                     # ALU has 12 slots but VLEN=8, so at most one spilled vector/cycle
@@ -1056,6 +1071,20 @@ class KernelBuilder:
                         if second not in used:
                             return first, second
                     return None
+
+                def maybe_add_base_ready(g, st, r):
+                    if (
+                        not st["base_ready"]
+                        and r + 1 < rounds
+                        and (r + 1) % (forest_height + 1) != 0
+                        and r % (forest_height + 1) != 0
+                        and done_count >= base_ready_done_threshold
+                        and len(valu_slots) <= base_ready_valu_limit
+                    ):
+                        valu_slots.append(
+                            ("multiply_add", addr[g], idx[g], two_v, addr_update_const_v)
+                        )
+                        st["base_ready"] = True
 
                 if init_load_pair < group_count and next_init_ptr < group_count:
                     flow_slots.append(
@@ -1289,12 +1318,13 @@ class KernelBuilder:
                             elif r + 1 >= rounds:
                                 advance_after_update(g, sched_cycle + 1)
                             elif (r + 1) % (forest_height + 1) == 0:
-                                if done_count >= 13:
+                                if done_count >= zero_skip_done_threshold:
                                     advance_after_update(g, sched_cycle + 1)
                                 else:
                                     st["phase"] = "zero"
                             else:
                                 st["phase"] = "parity"
+                            maybe_add_base_ready(g, st, r)
                             st["ready"] = sched_cycle + 1
                             continue
                         if len(valu_slots) + 2 > SLOT_LIMITS["valu"]:
@@ -1302,13 +1332,22 @@ class KernelBuilder:
                                 valu_slots.append((op1, tmpa[g], val[g], hash_const_v[val1]))
                                 if add_alu_vec(op3, hash_tmp, val[g], hash_const_v[val3]):
                                     st["phase"] = "hash_combine"
+                                elif (
+                                    done_count >= hash_half_alu_done_threshold
+                                    and add_alu_vec_lanes(
+                                        op3, hash_tmp, val[g], hash_const_v[val3], 4, 4
+                                    )
+                                ):
+                                    st["phase"] = "hash_pre_second_low4"
                                 else:
                                     st["phase"] = "hash_pre_second"
+                                maybe_add_base_ready(g, st, r)
                                 st["ready"] = sched_cycle + 1
                             continue
                         valu_slots.append((op1, tmpa[g], val[g], hash_const_v[val1]))
                         valu_slots.append((op3, hash_tmp, val[g], hash_const_v[val3]))
                         st["phase"] = "hash_combine"
+                        maybe_add_base_ready(g, st, r)
                         st["ready"] = sched_cycle + 1
                         continue
                     if phase == "addr":
@@ -1367,17 +1406,6 @@ class KernelBuilder:
                     elif phase == "xor":
                         if not add_simple_vec("^", val[g], val[g], addr[g]):
                             break
-                        if (
-                            r + 1 < rounds
-                            and (r + 1) % (forest_height + 1) != 0
-                            and r % (forest_height + 1) != 0
-                            and done_count >= 19
-                            and len(valu_slots) <= 3
-                        ):
-                            valu_slots.append(
-                                ("multiply_add", addr[g], idx[g], two_v, addr_update_const_v)
-                            )
-                            st["base_ready"] = True
                         st["phase"] = "hash_pre"
                         st["hash_i"] = 0
                         st["ready"] = sched_cycle + 1
@@ -1514,13 +1542,14 @@ class KernelBuilder:
                             advance_after_update(g, sched_cycle + 1)
                         elif (r + 1) % (forest_height + 1) == 0:
                             st["tmpb_slot"] = None
-                            if done_count >= 13:
+                            if done_count >= zero_skip_done_threshold:
                                 advance_after_update(g, sched_cycle + 1)
                             else:
                                 st["phase"] = "zero"
                         else:
                             st["tmpb_slot"] = None
                             st["phase"] = "parity"
+                        maybe_add_base_ready(g, st, r)
                         st["ready"] = sched_cycle + 1
                     elif phase == "hash_pre_second":
                         tmpb_slot = st["tmpb_slot"]
@@ -1532,6 +1561,21 @@ class KernelBuilder:
                         if not add_simple_vec(op3, hash_tmp, val[g], hash_const_v[val3]):
                             break
                         st["phase"] = "hash_combine"
+                        maybe_add_base_ready(g, st, r)
+                        st["ready"] = sched_cycle + 1
+                    elif phase == "hash_pre_second_low4":
+                        tmpb_slot = st["tmpb_slot"]
+                        if tmpb_slot is None:
+                            continue
+                        hash_tmp = tmpb[tmpb_slot]
+                        hi = st["hash_i"]
+                        _op1, _val1, _op2, op3, val3 = HASH_STAGES[hi]
+                        if not add_alu_vec_lanes(
+                            op3, hash_tmp, val[g], hash_const_v[val3], 0, 4
+                        ):
+                            break
+                        st["phase"] = "hash_combine"
+                        maybe_add_base_ready(g, st, r)
                         st["ready"] = sched_cycle + 1
                     elif phase == "parity":
                         if not add_simple_vec("&", tmpa[g], val[g], one_v):
