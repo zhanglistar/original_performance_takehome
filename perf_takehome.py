@@ -56,9 +56,11 @@ class KernelBuilder:
     virtual_tmp_spill_vectors = 0
     virtual_schedule_chunk_size = 0
     use_additive_index_update = False
-    use_dag_scheduler = False
-    dag_critical_slack = 0
+    use_dag_scheduler = True
+    dag_critical_slack = 64
     dag_virtual_pressure_aware = False
+    dag_priority_mode = 2
+    dag_score_cap = 3000
     use_scalar_root_value = False
     strict_virtual_coloring = True
     use_biased_heap_index = False
@@ -74,7 +76,7 @@ class KernelBuilder:
     simple_valu_first_limit = 4
     simple_valu_first_done_threshold = 0
     base_ready_done_threshold = 21
-    base_ready_valu_limit = 4
+    base_ready_valu_limit = 5
     hash_half_alu_done_threshold = 18
     level3_round3_groups = {2, 20, 21, 22, 25, 26, 29, 30, 31}
     level3_round14_groups = set(range(32)) - {28, 29, 30, 31}
@@ -310,11 +312,32 @@ class KernelBuilder:
                 readers_since_write[addr].add(op_i)
 
         critical = [0] * len(ops)
+        downstream_count = [0] * len(ops)
+        downstream_resource = [0] * len(ops)
+        resource_weight = {
+            "load": 6,
+            "flow": 4,
+            "valu": 2,
+            "store": 1,
+            "alu": 1,
+        }
         for op_i in range(len(ops) - 1, -1, -1):
             if successors[op_i]:
                 critical[op_i] = max(
                     latency + critical[succ]
                     for succ, latency in successors[op_i].items()
+                )
+                downstream_count[op_i] = min(
+                    self.dag_score_cap,
+                    sum(1 + downstream_count[succ] for succ in successors[op_i]),
+                )
+                downstream_resource[op_i] = min(
+                    self.dag_score_cap,
+                    sum(
+                        resource_weight.get(ops[succ][0], 1)
+                        + downstream_resource[succ]
+                        for succ in successors[op_i]
+                    ),
                 )
 
         virtual_word_base = {
@@ -376,6 +399,15 @@ class KernelBuilder:
                             base in active_virtuals
                             and virtual_touch_remaining[base] == 1
                             for base in virtual_bases_by_op[i]
+                        ),
+                        -(
+                            len(successors[i])
+                            if self.dag_priority_mode == 1
+                            else downstream_count[i]
+                            if self.dag_priority_mode == 2
+                            else downstream_resource[i]
+                            if self.dag_priority_mode == 3
+                            else 0
                         ),
                         i,
                     ),
