@@ -521,6 +521,11 @@ class KernelBuilder:
         SEL4G = int(os.environ.get("SEL4G", "0"))    # r=4 改 select 的组数（死区广播方案下禁用）
         EARLYW = int(os.environ.get("EARLYW", "5"))  # 早于此 wavefront 的 r1-3 select 改回 gather
         EARLY1G = int(os.environ.get("EARLY1G", "0"))  # 前多少组只把 r1 改回 gather（填最深空窗）
+        EARLY_GATHER = {
+            tuple(map(int, item.split(":")))
+            for item in os.environ.get("EARLY_GATHER", "1:3,3:3").split(",")
+            if item
+        }
         # 末组从第几轮起 L2/L3 改 gather 缩 drain（默认倒数第 2 轮起——终链上 load 已空闲）
         TAILG = int(os.environ.get("TAILG", str(max(rounds - 1, 2))))
         TAILGN = int(os.environ.get("TAILGN", "1"))        # 末几组适用 TAILG
@@ -874,6 +879,8 @@ class KernelBuilder:
                 sel = False
             if sel and rr == 1 and g < EARLY1G:
                 sel = False
+            if sel and (g, rr) in EARLY_GATHER:
+                sel = False
             if sel and g >= ng - TAILGN and level in (2, 3) and rr >= TAILG:
                 sel = False
             return sel
@@ -904,6 +911,8 @@ class KernelBuilder:
                     sel = False
                 if sel and r == 1 and g < EARLY1G:
                     sel = False   # r1 的 gather 发得最早（~b16），专门填 head 空窗最深处
+                if sel and (g, r) in EARLY_GATHER:
+                    sel = False
                 if sel and g >= ng - TAILGN and level in (2, 3) and r >= TAILG:
                     sel = False   # 末组的晚轮 select 改 gather：终链上 load 早已空闲，
                                   # gather 2 级比系数 select 4 级短，直接缩 drain
@@ -991,7 +1000,7 @@ class KernelBuilder:
                     # represented as F[idx] ^ C5 and restores the exact value.
                     vop(ua, "^", val, val, tmp)
                 else:
-                    vop(ua, "^", val, val, C5F0 if _fold0 else C5)   # 下轮是 L0 → 常量并入 F0
+                    vop(ua, "^", val, val, C5F0 if _fold0 else C5)
                     vop(ua, "^", val, val, tmp)
                 # A(绝对地址)更新：newA = 2A + CFP + parity（CFP=1-forest_p）。三处省算子：
                 # ① 最后一轮 idx 不再用到 → 省；
