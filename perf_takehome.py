@@ -285,7 +285,8 @@ class KernelBuilder:
         - hash 阶段 0/2/4 折成一条 multiply_add（val*k+c）；移位阶段各用 1 个临时。
         - node_val 数据相关：低层用「pair 线性插值 + 系数 select」免 gather——相邻两节点的
           node_val 对绝对地址 A 线性（nv = A*D + E，mod 2^32 恒等），pair 间 vselect 选系数、
-          末尾一条 MAC 出值；其余层保持标量 gather；idx 存绝对地址免 gather 的地址加（pre-offset）。
+          末尾一条 MAC 出值；L1-L3 的 idx 用镜像局部路径缩短更新链，进入 L4 前恢复成
+          绝对地址，使深层标量 gather 仍然不需要地址加法。
         - load 的时间分布：最早两个 wavefront 组的 r1-3 select 换回 gather（EARLYW），填掉
           「前 ~100 拍 wavefront 未到 gather 轮」的 load 空窗；head 常量隔一个走 flow add_imm
           （CONSTFLOW，基于恒零 scratch 词），省 head 的 load 槽。
@@ -469,8 +470,15 @@ class KernelBuilder:
         ONE = bvec(1)
         TWO = bvec(2)
 
-        # pre-offset：idx 存成绝对地址 A = forest_p + idx，则 gather = load(nv, A) 免 addr-add。
-        # 需要运行期常量：rvec(j)=broadcast(forest_p+j)（比较用）、CFP=1-forest_p（idx 更新用）。
+        # Hybrid mirrored path: L1-L3 store the mirrored local index
+        # R=(2^(L+1)-2)-tree_index.  With an F^C5 cached node, qbit is exactly
+        # the next mirrored branch bit, so R_next=2*R+qbit.  Before L4 we
+        # convert once back to the absolute address, preserving free gathers
+        # throughout the deep levels.
+        MIRRORPATH = os.environ.get("MIRRORPATH", "1") == "1"
+
+        # 深层 pre-offset：idx 存绝对地址 A = forest_p + tree_idx，gather 免 addr-add。
+        # L1-L3 在 MIRRORPATH 下临时改存镜像局部 R；rvec/CFP 仍服务于深层 A 表示。
         rcache = {}
 
         def rvec(j):
@@ -519,7 +527,7 @@ class KernelBuilder:
         # L4 选择性去重（r=4/r=15）与早期 gather 换位的旋钮（见下），影响 fpp/FV_raw 的覆盖范围
         SEL15 = int(os.environ.get("SEL15", "5"))    # 末轮改 MAC-select 的组数（alu 组，死区广播）
         SEL4G = int(os.environ.get("SEL4G", "0"))    # r=4 改 select 的组数（死区广播方案下禁用）
-        EARLYW = int(os.environ.get("EARLYW", "5"))  # 早于此 wavefront 的 r1-3 select 改回 gather
+        EARLYW = int(os.environ.get("EARLYW", "0" if MIRRORPATH else "5"))
         EARLY1G = int(os.environ.get("EARLY1G", "0"))  # 前多少组只把 r1 改回 gather（填最深空窗）
         EARLY_GATHER = {
             tuple(map(int, item.split(":")))
@@ -555,6 +563,8 @@ class KernelBuilder:
             return NV2 + (g if g < SPECG else SPECG + (ng - 1 - g)) * VLEN
 
         def is_spec(g, rr):
+            if MIRRORPATH:
+                return False
             if (rr % period) < 4 or forest_height < 4:
                 return False
             if g < SPECG and 4 <= rr < min(4 + SPECR, forest_height + 1) and rr < rounds - 1:
@@ -569,7 +579,7 @@ class KernelBuilder:
         # 共享地址标量 fpp[k] = forest_p + k（k 覆盖去重层所有节点号及 rvec 用到的 j）：一次 prefix
         # 生成、rvec 与 Fvec 共用，把原本 ~28 条散在 head 的 flow add_imm 全消掉（trace-driven）。
         nmax = ((1 << (max(dedup_levels) + 1)) - 1) if dedup_levels else 3
-        nfpp = max(nmax, 30) if use_l4 else nmax  # L4 另需 fpp[15..29]（E 系数与 rvec 的地址标量）
+        nfpp = max(nmax, 31 if MIRRORPATH else 30) if use_l4 else nmax
         fpp = seq(fvp, max(3, nfpp), 1)          # fpp[0]=fvp
 
         # Fvec 节点值：去重层的节点号是连续区间 0..nmax-1 → 用 vload 成块取 forest（每条 8 个），
@@ -636,12 +646,24 @@ class KernelBuilder:
             """给第 L 层建 pair 系数向量；raw_off = 该层 base 节点在 FV_raw 里的偏移。"""
             base = (1 << L) - 1
             for j in range(1 << (L - 1)):
-                k = base + 2 * j
                 d_s, m_s, e_s = _dme[_dme_n[0] % 2]
                 _dme_n[0] += 1
-                ops.append(("alu", ("-", d_s, FV_raw + (k - raw_off) + 1, FV_raw + (k - raw_off))))
-                ops.append(("alu", ("*", m_s, fpp[k], d_s)))
-                ops.append(("alu", ("-", e_s, FV_raw + (k - raw_off), m_s)))
+                if MIRRORPATH and L <= 3:
+                    # R pair {2j,2j+1} maps to descending original nodes.
+                    i0 = (1 << (L + 1)) - 2 - 2 * j
+                    i1 = i0 - 1
+                    x0 = 2 * j
+                    ops.append(("alu", ("-", d_s, FV_raw + (i1 - raw_off),
+                                         FV_raw + (i0 - raw_off))))
+                    ops.append(("alu", ("*", m_s, oconst(x0), d_s)))
+                    ops.append(("alu", ("-", e_s, FV_raw + (i0 - raw_off), m_s)))
+                    k = i1
+                else:
+                    k = base + 2 * j
+                    ops.append(("alu", ("-", d_s, FV_raw + (k - raw_off) + 1,
+                                         FV_raw + (k - raw_off))))
+                    ops.append(("alu", ("*", m_s, fpp[k], d_s)))
+                    ops.append(("alu", ("-", e_s, FV_raw + (k - raw_off), m_s)))
                 Dv = self.alloc_scratch(f"pD{k}", VLEN)
                 Ev = self.alloc_scratch(f"pE{k}", VLEN)
                 ops.append(("valu", ("vbroadcast", Dv, d_s)))
@@ -663,8 +685,8 @@ class KernelBuilder:
             ops.append(("alu", ("-", m1, FV_raw + 6, FV_raw + 5)))
             ops.append(("alu", ("-", m2, FV_raw + 4, FV_raw + 3)))
             ops.append(("alu", ("-", dd_s, m1, m2)))
-            ops.append(("alu", ("*", m1, fpp[5], m1)))       # (fp+5)·D1
-            ops.append(("alu", ("*", m2, fpp[3], m2)))       # (fp+3)·D0
+            ops.append(("alu", ("*", m1, fpp[5], m1)))
+            ops.append(("alu", ("*", m2, fpp[3], m2)))
             ops.append(("alu", ("-", m3, FV_raw + 5, m1)))   # E1
             ops.append(("alu", ("-", m1, FV_raw + 3, m2)))   # E0
             ops.append(("alu", ("-", ee_s, m3, m1)))
@@ -698,9 +720,10 @@ class KernelBuilder:
                     ops.append(("store", ("vstore", fpp[15 + c * VLEN], base), "l4tree"))
             pd, pe = None, None   # 上一对的 d/e（rotor，供 Δ 相减）
             for j in range(8):
-                k = 15 + 2 * j
                 d_r, m_r, e_r = _dme[j % 2]           # 2 路 rotor：算 Δ 时上一对仍在
-                ops.append(("alu", ("-", d_r, FV_raw + (k - 15) + 1, FV_raw + (k - 15))))
+                k = 15 + 2 * j
+                ops.append(("alu", ("-", d_r, FV_raw + (k - 15) + 1,
+                                     FV_raw + (k - 15))))
                 ops.append(("alu", ("*", m_r, fpp[k], d_r)))
                 ops.append(("alu", ("-", e_r, FV_raw + (k - 15), m_r)))
                 ds, es = scalar(f"l4d{j}"), scalar(f"l4e{j}")
@@ -726,14 +749,15 @@ class KernelBuilder:
 
         dedup_set = set(dedup_levels)
 
-        def cmp_gt(ua, dest, j, idx):
+        def cmp_gt(ua, dest, j, idx, local=False):
             """dest = (forest_p + j < A)。alu 组走 8 条标量、阈值直接用标量 fpp[j]
             （标量比较不需要广播向量——L4 的 7 个 rvec 全省掉）；valu 组用 rvec(j)。"""
             if ua:
                 for l in range(VLEN):
-                    ops.append(("alu", ("<", dest + l, fpp[j], idx + l)))
+                    threshold = oconst(j) if local else fpp[j]
+                    ops.append(("alu", ("<", dest + l, threshold, idx + l)))
             else:
-                ops.append(("valu", ("<", dest, rvec(j), idx)))
+                ops.append(("valu", ("<", dest, bvec(j) if local else rvec(j), idx)))
 
         def emit_node_select(ua, level, nv, tmp, t2a, t2b, idx):
             """选出 forest[idx]（idx 在第 level 层，存绝对地址 A），结果放 nv。
@@ -749,7 +773,11 @@ class KernelBuilder:
                 if L1SEL:
                     # 上一轮（L0）的 parity 还活在 tmp（其 idx 更新的最后一笔 tmp 写、本轮
                     # select 先于一切 tmp 写）——一条 flow vselect 直接选 F1/F2，省 1 valu
-                    if C5NODEFOLD:
+                    if MIRRORPATH:
+                        # R itself is the previous qbit: 1 selects original
+                        # left node F1, 0 selects original right node F2.
+                        ops.append(("flow", ("vselect", nv, idx, F1V, F2V)))
+                    elif C5NODEFOLD:
                         # tmp holds the deferred value's parity. C5 is odd, so
                         # true parity is inverted: tmp=1 selects the left node.
                         ops.append(("flow", ("vselect", nv, tmp, F1V, F2V)))
@@ -762,22 +790,32 @@ class KernelBuilder:
                 D0, E0 = pair_DE[(2, 0)]
                 D1, E1 = pair_DE[(2, 1)]
                 ca = t2a if NVMERGE else tmp                     # cond（非合并时用私有 tmp）
-                cmp_gt(ua, ca, base + 1, idx)                    # A ≥ fp+base+2
+                if MIRRORPATH:
+                    cmp_gt(ua, ca, 1, idx, local=True)           # R >= 2
+                else:
+                    cmp_gt(ua, ca, base + 1, idx)                # A ≥ fp+base+2
                 ops.append(("flow", ("vselect", nv, ca, D1, D0)))
                 ops.append(("flow", ("vselect", ca, ca, E1, E0)))   # 读旧 ca(cond) 写新，同拍合法
                 vmac(ua, nv, idx, nv, ca)                        # nv = A*D_sel + E_sel
                 return nv
             # level ≥ 3：2^(L-1) 个 pair 的线性系数 select（n-1 cmp + 2(n-1) vselect + 1 MAC）
             npair = 1 << (level - 1)
+            local_coord = MIRRORPATH and level <= 3
             dacc = t2b if NVMERGE else nv                        # D-acc；E-acc 恒在私有 tmp
             D0, E0 = pair_DE[(level, 0)]
             D1, E1 = pair_DE[(level, 1)]
-            cmp_gt(ua, t2a, base + 1, idx)
+            if local_coord:
+                cmp_gt(ua, t2a, 1, idx, local=True)              # R >= 2
+            else:
+                cmp_gt(ua, t2a, base + 1, idx)
             ops.append(("flow", ("vselect", dacc, t2a, D1, D0)))
             ops.append(("flow", ("vselect", tmp, t2a, E1, E0)))
             for j in range(2, npair):
                 Dj, Ej = pair_DE[(level, j)]
-                cmp_gt(ua, t2a, base + 2 * j - 1, idx)           # A ≥ fp+base+2j
+                if local_coord:
+                    cmp_gt(ua, t2a, 2 * j - 1, idx, local=True)  # R >= 2j
+                else:
+                    cmp_gt(ua, t2a, base + 2 * j - 1, idx)       # A ≥ fp+base+2j
                 ops.append(("flow", ("vselect", dacc, t2a, Dj, dacc)))
                 ops.append(("flow", ("vselect", tmp, t2a, Ej, tmp)))
             vmac(ua, nv, idx, dacc, tmp)                         # nv = A*D_sel + E_sel
@@ -794,7 +832,7 @@ class KernelBuilder:
                 Qd, Qe = pair_DE[(4, j)]                         # Δ 系数向量（死区广播）
                 qb = tmp if j % 2 else q2
                 vmac(ua, qb, idx, Qd, Qe)                        # Qⱼ = A·ΔDⱼ + ΔEⱼ
-                cmp_gt(ua, t2a, 14 + 2 * j, idx)                 # cⱼ = (A ≥ fp+15+2j)
+                cmp_gt(ua, t2a, 14 + 2 * j, idx)                 # A ≥ fp+15+2j
                 vmac(ua, nv, t2a, qb, nv)                        # acc += cⱼ·Qⱼ
             return nv
 
@@ -823,8 +861,8 @@ class KernelBuilder:
 
         # 发射顺序参数（emit_gr 里 EARLYW 要用 wavefront 位置，提前解析）
         EMIT = os.environ.get("EMIT", "diagtail")
-        SK = int(os.environ.get("SKEW", "5"))
-        TK = int(os.environ.get("TAILK", "4"))
+        SK = int(os.environ.get("SKEW", "7" if MIRRORPATH else "5"))
+        TK = int(os.environ.get("TAILK", "2" if MIRRORPATH else "4"))
 
         # L4 select 的目标组选择：
         # r15：从倒数第 3 组起**降序**选（tail 解剖：终段 b1089-1100 是末 3 组 r15 gather 以 2/拍
@@ -967,9 +1005,19 @@ class KernelBuilder:
                 elif sel:
                     nv_src = emit_node_select(ua, level, nv, tmp, t2a, t2b, idx)
                 else:
-                    # idx 已是绝对地址 A → gather 直接 load(nv, idx)，免 addr-add
+                    # Absolute-address mode gathers directly.  The mirrored
+                    # low levels first reconstruct A into the node buffer.
+                    gather_addr = idx
+                    if MIRRORPATH and level in (1, 2, 3):
+                        # A = forest_p + (2^(L+1)-2) - R.  Only a handful of
+                        # deliberately early low-level rounds gather, so use
+                        # scalar ALU lanes and avoid persistent base vectors.
+                        mirror_base = fpp[(1 << (level + 1)) - 2]
+                        for lane in range(VLEN):
+                            ops.append(("alu", ("-", nv + lane, mirror_base, idx + lane)))
+                        gather_addr = nv
                     for lane in range(VLEN):
-                        op = ("load", ("load", nv + lane, idx + lane))
+                        op = ("load", ("load", nv + lane, gather_addr + lane))
                         if C5MEML4 and level == 4:
                             op += ("l4tree",)
                         ops.append(op)
@@ -982,9 +1030,10 @@ class KernelBuilder:
                 # 即空闲的 nv；下方 idx 更新缩为「&→add」两级
                 tb = (TAILB and g >= ng - TAILB and r != rounds - 1
                       and level not in (0, forest_height)
-                      and g not in idxflow_groups and not is_spec(g, r + 1))
+                      and g not in idxflow_groups and not is_spec(g, r + 1)
+                      and not (MIRRORPATH and level in (1, 2, 3)))
                 if tb:
-                    vmac(ua, nv, idx, TWO, CFP1 if _fold_node else CFP)        # B/B' for parity form
+                    vmac(ua, nv, idx, TWO, CFP1 if _fold_node else CFP)
                 vmac(ua, val, val, K0, C0)                                    # 阶段0
                 vop(ua, ">>", tmp, val, S19)                                  # 阶段1
                 vop(ua, "^", val, val, C1)
@@ -1009,7 +1058,28 @@ class KernelBuilder:
                 # ③ L0 轮 idx 恒为 forest_p（常量）→ A = forest_p+1+parity = rvec(1)+parity，省掉 MAC。
                 if r != rounds - 1 and level != forest_height:
                     fl = g in idxflow_groups                                # +c 走 flow vselect
-                    if is_spec(g, r + 1):
+                    if MIRRORPATH and level in (0, 1, 2, 3):
+                        if level == 0:
+                            if _fold_node:
+                                # qbit is exactly mirrored child R in L1.
+                                vop(ua, "&", idx, val, ONE)
+                            else:
+                                vop(ua, "&", tmp, val, ONE)
+                                vop(ua, "-", idx, ONE, tmp)       # R=1-p
+                        elif level in (1, 2):
+                            vop(ua, "&", tmp, val, ONE)
+                            if not _fold_node:
+                                vop(ua, "-", tmp, ONE, tmp)       # branch bit=1-p
+                            vmac(ua, idx, idx, TWO, tmp)           # R'=2R+branch
+                        else:
+                            # Build L4's mirrored local index, then convert once
+                            # to the absolute address A=forest_p+30-R4.
+                            vop(ua, "&", tmp, val, ONE)
+                            if not _fold_node:
+                                vop(ua, "-", tmp, ONE, tmp)
+                            vmac(ua, nv, idx, TWO, tmp)
+                            vop(ua, "-", idx, rvec(30), nv)
+                    elif is_spec(g, r + 1):
                         # 双子预取版 idx 更新：A0=2A+CFP 不等 parity 就能算（只读 idx），两个
                         # 候选地址就地写进 nv/nv2 作 gather 地址缓冲（load 读旧地址写新值，
                         # 程序序上 vselect 在前保证其读到的是地址）；idx 由 parity 选出。
