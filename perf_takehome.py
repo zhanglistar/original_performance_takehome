@@ -18,6 +18,7 @@ We recommend you look through problem.py next.
 
 import os
 from collections import defaultdict
+import heapq
 import random
 import unittest
 
@@ -38,6 +39,7 @@ from problem import (
 )
 
 _BARRIER_OPS = {"pause", "halt", "jump", "cond_jump", "cond_jump_rel", "jump_indirect"}
+_VIRTUAL_VEC_BASE = 1_000_000
 
 
 def slot_rw(engine, slot):
@@ -224,6 +226,208 @@ def schedule(ops):
     return [b for b in bundles if b]  # 丢掉空 bundle（不影响计费/正确性，前提：无绝对跳转目标）
 
 
+def schedule_dag(ops):
+    """Critical-path list scheduler with explicit scratch and memory DAG edges."""
+    nodes = []
+    preds = []
+    succs = []
+    last_write = {}
+    reads_since_write = defaultdict(set)
+    last_mem_write = {}
+    mem_reads_since_write = defaultdict(set)
+
+    def add_edge(src, dst, latency):
+        if src < 0 or src == dst:
+            return
+        old = preds[dst].get(src)
+        if old is None or latency > old:
+            preds[dst][src] = latency
+            succs[src][dst] = latency
+
+    for op in ops:
+        engine, slot = op[0], op[1]
+        region = op[2] if len(op) > 2 else None
+        reads, writes, mr, mw, barrier = slot_rw(engine, slot)
+        if barrier:
+            # Kernel barriers are injected after scheduling; keep the generic
+            # scheduler conservative if one appears in an experiment.
+            return schedule(ops)
+        nid = len(nodes)
+        nodes.append((engine, slot))
+        preds.append({})
+        succs.append({})
+
+        for addr in reads:
+            add_edge(last_write.get(addr, -1), nid, 1)  # RAW
+            reads_since_write[addr].add(nid)
+        for addr in writes:
+            add_edge(last_write.get(addr, -1), nid, 1)  # WAW
+            for reader in reads_since_write[addr]:
+                add_edge(reader, nid, 0)                # WAR: same bundle is safe
+            reads_since_write[addr].clear()
+            last_write[addr] = nid
+
+        if mr:
+            add_edge(last_mem_write.get(region, -1), nid, 1)
+            mem_reads_since_write[region].add(nid)
+        if mw:
+            add_edge(last_mem_write.get(region, -1), nid, 0)
+            for reader in mem_reads_since_write[region]:
+                add_edge(reader, nid, 0)
+            mem_reads_since_write[region].clear()
+            last_mem_write[region] = nid
+
+    # Longest downstream dependency distance.  A small resource bonus keeps
+    # scarce load/valu work ahead of abundant ALU work at equal criticality.
+    critical = [1] * len(nodes)
+    downstream = [0] * len(nodes)
+    for nid in range(len(nodes) - 1, -1, -1):
+        if succs[nid]:
+            critical[nid] = max(lat + critical[s] for s, lat in succs[nid].items())
+            downstream[nid] = min(
+                10000, len(succs[nid]) + sum(downstream[s] for s in succs[nid])
+            )
+
+    indegree = [len(p) for p in preds]
+    ready_time = [0] * len(nodes)
+    ready = {nid for nid, degree in enumerate(indegree) if degree == 0}
+    scheduled_cycle = [-1] * len(nodes)
+    bundles = []
+    remaining = len(nodes)
+    resource_weight = {"load": 4, "valu": 3, "flow": 2, "alu": 1, "store": 0}
+    priority_mode = os.environ.get("DAG_PRIORITY", "critical")
+
+    while remaining:
+        cycle = len(bundles)
+        bundle = {}
+        counts = defaultdict(int)
+        made_progress = True
+        while made_progress:
+            candidates = [
+                nid for nid in ready
+                if ready_time[nid] <= cycle
+                and counts[nodes[nid][0]] < SLOT_LIMITS[nodes[nid][0]]
+            ]
+            if not candidates:
+                break
+            if priority_mode == "original":
+                nid = min(candidates)
+            elif priority_mode == "window":
+                front = min(candidates)
+                window_size = int(os.environ.get("DAG_WINDOW", "256"))
+                window = [n for n in candidates if n <= front + window_size]
+                nid = max(
+                    window,
+                    key=lambda n: (
+                        critical[n], resource_weight[nodes[n][0]], downstream[n], -n
+                    ),
+                )
+            else:
+                nid = max(
+                    candidates,
+                    key=lambda n: (
+                        critical[n], resource_weight[nodes[n][0]], downstream[n], -n
+                    ),
+                )
+            ready.remove(nid)
+            engine, slot = nodes[nid]
+            bundle.setdefault(engine, []).append((nid, slot))
+            counts[engine] += 1
+            scheduled_cycle[nid] = cycle
+            remaining -= 1
+            for succ, latency in succs[nid].items():
+                indegree[succ] -= 1
+                ready_time[succ] = max(ready_time[succ], cycle + latency)
+                if indegree[succ] == 0:
+                    ready.add(succ)
+
+        if not bundle:
+            # Every remaining ready node is a latency-1 successor of this
+            # cycle's work.  Advancing creates the required next bundle.
+            bundles.append({})
+            continue
+        bundles.append({
+            engine: [slot for _nid, slot in sorted(slots)]
+            for engine, slots in bundle.items()
+        })
+
+    return [bundle for bundle in bundles if bundle]
+
+
+def color_virtual_vectors(bundles, virtual_base, nvec):
+    """Color scheduled virtual VLEN vectors by their actual bundle intervals."""
+    first = [len(bundles)] * nvec
+    last = [-1] * nvec
+    virtual_end = virtual_base + nvec * VLEN
+
+    for cycle, bundle in enumerate(bundles):
+        for engine, slots in bundle.items():
+            for slot in slots:
+                reads, writes, *_ = slot_rw(engine, slot)
+                for addr in reads | writes:
+                    if virtual_base <= addr < virtual_end:
+                        vid = (addr - virtual_base) // VLEN
+                        first[vid] = min(first[vid], cycle)
+                        last[vid] = max(last[vid], cycle)
+
+    colors = [-1] * nvec
+    active = []  # (end_cycle, color)
+    free_colors = []
+    ncolors = 0
+    for vid in sorted((v for v in range(nvec) if last[v] >= 0), key=lambda v: first[v]):
+        start = first[vid]
+        while active and active[0][0] < start:
+            _end, color = heapq.heappop(active)
+            heapq.heappush(free_colors, color)
+        if free_colors:
+            color = heapq.heappop(free_colors)
+        else:
+            color = ncolors
+            ncolors += 1
+        colors[vid] = color
+        heapq.heappush(active, (last[vid], color))
+    return colors, ncolors
+
+
+def rewrite_virtual_vectors(bundles, virtual_base, colors, physical_base):
+    virtual_end = virtual_base + len(colors) * VLEN
+
+    def remap(addr):
+        if isinstance(addr, int) and virtual_base <= addr < virtual_end:
+            off = addr - virtual_base
+            vid, lane = divmod(off, VLEN)
+            return physical_base + colors[vid] * VLEN + lane
+        return addr
+
+    def rewrite_slot(engine, slot):
+        op = slot[0]
+        values = list(slot)
+        if engine in ("alu", "valu", "store"):
+            positions = range(1, len(values))
+        elif engine == "load":
+            positions = (1,) if op == "const" else (1, 2)
+        elif engine == "flow":
+            if op in ("select", "vselect"):
+                positions = range(1, len(values))
+            elif op in ("add_imm", "cond_jump", "cond_jump_rel"):
+                positions = (1, 2) if op == "add_imm" else (1,)
+            elif op in ("coreid", "trace_write", "jump_indirect"):
+                positions = (1,)
+            else:
+                positions = ()
+        else:
+            positions = ()
+        for pos in positions:
+            values[pos] = remap(values[pos])
+        return tuple(values)
+
+    return [
+        {engine: [rewrite_slot(engine, slot) for slot in slots]
+         for engine, slots in bundle.items()}
+        for bundle in bundles
+    ]
+
+
 
 
 class KernelBuilder:
@@ -311,6 +515,9 @@ class KernelBuilder:
         # 阶梯（~116 拍/槽）对齐，无真实冲突。
         NVMERGE = os.environ.get("NVMERGE", "0") == "1"
         SHAREPAIR = int(os.environ.get("SHAREPAIR", "0"))
+        VIRTUAL_TEMPS = os.environ.get("VIRTUAL_TEMPS", "1") == "1"
+        if VIRTUAL_TEMPS:
+            assert not NVMERGE and not SHAREPAIR
         IDX = self.alloc_scratch("idx", batch_size)
         VAL = self.alloc_scratch("val", batch_size)
         # （TMP/NV 工作区推迟到 alu 组划分确定后分配——槽位数取决于配对方式，见 alu_groups 处。）
@@ -328,7 +535,7 @@ class KernelBuilder:
         # 部分组的 hash/idx 走标量 ALU（12 槽/拍、原本闲置），把瓶颈 valu 的活分流过去：
         # 总吞吐 48 elem/拍(仅 valu) → 60(valu+alu)。N_ALU=6 由 roofline 扫参平衡两引擎得出
         # （alu 组均匀分散 + group-major 打包下实测最优）。env 可复扫调参。
-        N_ALU = int(os.environ.get("N_ALU", "8"))
+        N_ALU = int(os.environ.get("N_ALU", "7"))
         # alu 组划分提前到此（TMP/NV 槽位分配要用）：均匀撒到全 32 组，让 body 全程都给 alu
         # 供活（trace 实证、扫参得最优）。注意不能用 (i*stride)%ng——N_ALU>8 时回绕重复、
         # set 去重后实际组数缩水（此 bug 曾让 N_ALU=9/10 的扫参全部空转）。
@@ -346,26 +553,34 @@ class KernelBuilder:
         def _pairable(g):
             return SHAREPAIR == 1 or (SHAREPAIR == 2 and g not in alu_groups)
 
-        _slot, _shared_slots, nslots = {}, set(), 0
-        _poolrank = {}   # 共享组在尾轮小池里的槽位（按共享组序号均衡，勿用 g%4——alu 组
-        for g in range(ng):  # 恰占满 g%4==0，会把 valu 组挤到 3 个槽上 8 深串行）
-            p = g - ng // 2
-            if SHAREPAIR and p >= 0 and _pairable(g) and _pairable(p):
-                _slot[g] = _slot[p]
-                _shared_slots.add(_slot[p])
-            else:
-                _slot[g] = nslots
-                nslots += 1
-        _npool = 0
-        for g in range(ng):
-            if _slot[g] in _shared_slots:
-                _poolrank[g] = _npool % 4
-                _npool += 1
-        TMP = self.alloc_scratch("tmp", nslots * VLEN)     # 每组一个临时向量（可配对共享）
-        NV = TMP if NVMERGE else self.alloc_scratch("nv", nslots * VLEN)   # gather/select 结果区
-        if SHAREPAIR:
-            TMPT = self.alloc_scratch("tmpt", VLEN * 4)    # 尾轮小池（见上）
-            NVT = self.alloc_scratch("nvt", VLEN * 4)
+        _slot, _shared_slots, _poolrank = {}, set(), {}
+        if VIRTUAL_TEMPS:
+            n_virtual_temp_vecs = ng * rounds * 2
+
+            def virtual_temp(g, r, kind):
+                return _VIRTUAL_VEC_BASE + ((g * rounds + r) * 2 + kind) * VLEN
+
+            TMP = NV = None
+        else:
+            nslots = 0
+            for g in range(ng):
+                p = g - ng // 2
+                if SHAREPAIR and p >= 0 and _pairable(g) and _pairable(p):
+                    _slot[g] = _slot[p]
+                    _shared_slots.add(_slot[p])
+                else:
+                    _slot[g] = nslots
+                    nslots += 1
+            _npool = 0
+            for g in range(ng):
+                if _slot[g] in _shared_slots:
+                    _poolrank[g] = _npool % 4
+                    _npool += 1
+            TMP = self.alloc_scratch("tmp", nslots * VLEN)
+            NV = TMP if NVMERGE else self.alloc_scratch("nv", nslots * VLEN)
+            if SHAREPAIR:
+                TMPT = self.alloc_scratch("tmpt", VLEN * 4)
+                NVT = self.alloc_scratch("nvt", VLEN * 4)
 
         def vop(ua, op, dest, a, b):
             """向量二元运算：ua=True 走 VLEN 条标量 alu，否则一条 valu。"""
@@ -525,7 +740,7 @@ class KernelBuilder:
         L3SEL = int(os.environ.get("L3SEL", str(ng)))              # 边际层多少组走 select（其余 gather）
 
         # L4 选择性去重（r=4/r=15）与早期 gather 换位的旋钮（见下），影响 fpp/FV_raw 的覆盖范围
-        SEL15 = int(os.environ.get("SEL15", "5"))    # 末轮改 MAC-select 的组数（alu 组，死区广播）
+        SEL15 = int(os.environ.get("SEL15", "3" if VIRTUAL_TEMPS else "5"))
         SEL4G = int(os.environ.get("SEL4G", "0"))    # r=4 改 select 的组数（死区广播方案下禁用）
         EARLYW = int(os.environ.get("EARLYW", "0" if MIRRORPATH else "5"))
         EARLY1G = int(os.environ.get("EARLY1G", "0"))  # 前多少组只把 r1 改回 gather（填最深空窗）
@@ -579,7 +794,8 @@ class KernelBuilder:
         # 共享地址标量 fpp[k] = forest_p + k（k 覆盖去重层所有节点号及 rvec 用到的 j）：一次 prefix
         # 生成、rvec 与 Fvec 共用，把原本 ~28 条散在 head 的 flow add_imm 全消掉（trace-driven）。
         nmax = ((1 << (max(dedup_levels) + 1)) - 1) if dedup_levels else 3
-        nfpp = max(nmax, 31 if MIRRORPATH else 30) if use_l4 else nmax
+        nfpp = (max(nmax, 31) if MIRRORPATH
+                else (max(nmax, 30) if use_l4 else nmax))
         fpp = seq(fvp, max(3, nfpp), 1)          # fpp[0]=fvp
 
         # Fvec 节点值：去重层的节点号是连续区间 0..nmax-1 → 用 vload 成块取 forest（每条 8 个），
@@ -701,13 +917,10 @@ class KernelBuilder:
         # L4（16 节点）选择性去重（SEL15）：把部分 alu 组的 r15 gather 换成 select——load 流从
         # ~b100 起全程饱和，从流里任何位置减 8 载入都让 load 终点提前 4 拍；换出的 select 算力
         # （cmp 走 alu、vselect 走 flow、MAC 走 valu）恰好落在尾部的空闲引擎上。
-        # scratch 装不下 8 对系数向量（128 词）→ **死区广播**：setup 只算 16 个 D/E 标量（16 词），
-        # 系数「向量」借用 8 个 donor 组（valu 组，其 r15 先排放完毕）已死的 tmp/nv 区，在尾部
-        # r15 序列中段注入 vbroadcast 现场生成；被转换组的 r15 排放在广播之后，整段浮到尾部的
-        # 空闲拍里执行。程序序保证语义：donor 全部用完 → 广播写 → 转换组读。
         # 系数存 Δ 形式（供 MAC 链条 select）：nv = (A·D0+E0) + Σⱼ cⱼ·(A·ΔDⱼ+ΔEⱼ)，
         # cⱼ = (A ≥ fp+15+2j) 是阶梯条件——选中 pair p 时恰好前 p 个 cⱼ=1，累加出 A·Dₚ+Eₚ。
         # MAC 链条全程 0 条 flow（尾部 flow 是墙、valu 反而大量空闲——select 形式要长成尾部的形状）。
+        L4PAIR_PREP = VIRTUAL_TEMPS and os.environ.get("L4PAIR_PREP", "0") == "1"
         l4de = []   # [(D0,E0), (ΔD1,ΔE1), ..., (ΔD7,ΔE7)] 持久标量，活到尾部广播
         C5MEML4 = C5NODEFOLD and use_l4
         if use_l4:
@@ -726,6 +939,13 @@ class KernelBuilder:
                                      FV_raw + (k - 15))))
                 ops.append(("alu", ("*", m_r, fpp[k], d_r)))
                 ops.append(("alu", ("-", e_r, FV_raw + (k - 15), m_r)))
+                if VIRTUAL_TEMPS:
+                    Dv = self.alloc_scratch(f"l4pD{j}", VLEN)
+                    Ev = self.alloc_scratch(f"l4p{'B' if L4PAIR_PREP else 'E'}{j}", VLEN)
+                    ops.append(("valu", ("vbroadcast", Dv, d_r)))
+                    ops.append(("valu", ("vbroadcast", Ev,
+                                          FV_raw + (k - 15) if L4PAIR_PREP else e_r)))
+                    pair_DE[(4, j)] = (Dv, Ev)
                 ds, es = scalar(f"l4d{j}"), scalar(f"l4e{j}")
                 if j == 0 or not L4MAC:
                     ops.append(("alu", ("+", ds, d_r, ZED)))      # 复制 Dⱼ/Eⱼ（ZED 恒 0）
@@ -735,17 +955,17 @@ class KernelBuilder:
                     ops.append(("alu", ("-", es, e_r, pe)))
                 pd, pe = d_r, e_r
                 l4de.append((ds, es))
-            # donor：前 8 个 valu 组（与被转换的 alu 组天然不相交）。其 tmp/nv 在自身 r15 排放
-            # 完毕后永久死亡，正好当 L4 系数向量的容身处。L4Q2=1 时再多征 4 个 donor 给被转换组
-            # 当第二 Q 缓冲（实测收益被额外 donor 的死亡门槛抵消，默认关）。
-            L4Q2 = os.environ.get("L4Q2", "0") == "1"
-            _donors = [g for g in range(ng) if g not in alu_groups][:12 if L4Q2 else 8]
-            for j in range(8):
-                dg = _donors[j]
-                pair_DE[(4, j)] = (TMP + _slot[dg] * VLEN, NV + _slot[dg] * VLEN)
-            _q2 = []
-            for dg in _donors[8:]:
-                _q2 += [TMP + _slot[dg] * VLEN, NV + _slot[dg] * VLEN]
+            if VIRTUAL_TEMPS:
+                _donors, _q2 = [], []
+            else:
+                L4Q2 = os.environ.get("L4Q2", "0") == "1"
+                _donors = [g for g in range(ng) if g not in alu_groups][:12 if L4Q2 else 8]
+                for j in range(8):
+                    dg = _donors[j]
+                    pair_DE[(4, j)] = (TMP + _slot[dg] * VLEN, NV + _slot[dg] * VLEN)
+                _q2 = []
+                for dg in _donors[8:]:
+                    _q2 += [TMP + _slot[dg] * VLEN, NV + _slot[dg] * VLEN]
 
         dedup_set = set(dedup_levels)
 
@@ -846,6 +1066,11 @@ class KernelBuilder:
         # 跨引擎转换，避散点 lane-sync）——把 valu/alu 之间那点余量磨平（整组太粗）。
         EXTRA = int(os.environ.get("EXTRA", "0"))
         xg = next((g for g in range(ng) if g not in alu_groups), -1)
+        HASH23_ALU_GROUPS = {
+            int(g) for g in os.environ.get(
+                "HASH23_ALU_GROUPS", "16,21" if VIRTUAL_TEMPS else ""
+            ).split(",") if g
+        }
         # 前 AE 轮所有组一律走 alu：头部所有组的早轮挤在一起把 valu 打满、gather 迟迟起不来
         # （load 空窗的根源），把最前面几轮的非-MAC 挪到头部尚有余量的 alu，让前端更快推进；
         # 每组只在 r=AE 处跨引擎交接一次。
@@ -861,8 +1086,8 @@ class KernelBuilder:
 
         # 发射顺序参数（emit_gr 里 EARLYW 要用 wavefront 位置，提前解析）
         EMIT = os.environ.get("EMIT", "diagtail")
-        SK = int(os.environ.get("SKEW", "7" if MIRRORPATH else "5"))
-        TK = int(os.environ.get("TAILK", "2" if MIRRORPATH else "4"))
+        SK = int(os.environ.get("SKEW", "4" if VIRTUAL_TEMPS else ("7" if MIRRORPATH else "5")))
+        TK = int(os.environ.get("TAILK", "4" if VIRTUAL_TEMPS else ("2" if MIRRORPATH else "4")))
 
         # L4 select 的目标组选择：
         # r15：从倒数第 3 组起**降序**选（tail 解剖：终段 b1089-1100 是末 3 组 r15 gather 以 2/拍
@@ -873,26 +1098,37 @@ class KernelBuilder:
         # 不可用（系数向量到尾部才广播出来，body 期读不到）。
         _c15 = sorted(alu_groups)
         sel15_groups = set(_c15[:SEL15])
+        if os.environ.get("SEL15_GROUPS"):
+            sel15_groups = {int(g) for g in os.environ["SEL15_GROUPS"].split(",") if g}
         sel4_groups = set()
         # SEL15A：再转换若干 **valu 组**的 r15 为「纯 ALU 逐 lane MAC 链」——valu 形式受
         # 「系数广播须等 valu 尾部饱和解除」的墙限制（SEL15>7 堆叠的根因）；纯 ALU 形式
         # 直接用 setup 期已就绪的 l4de 标量（乘/加/比较逐 lane 走 alu，无广播、无死区依赖、
         # 零 valu）。每组代价 +296 alu（尾部 alu 空闲 30-50%）、收益 −8 load（流末端 −4 拍）。
         # cond 缓冲借 setup 后死亡的 fvraw（4 槽）+ 尾部空闲 scratch，与 t2a 无冲突。
-        SEL15A = int(os.environ.get("SEL15A", "3"))
+        SEL15A = int(os.environ.get("SEL15A", "7" if VIRTUAL_TEMPS else "3"))
         _l4donors = set(_donors) if use_l4 else set()   # 死区系数宿主，绝不可被转换（会踩系数区）
-        _a15_cands = [g for g in range(ng)
-                      if g not in alu_groups and g not in _l4donors
-                      and g >= 11 and g < ng - 2]
+        _a15_preferred = [11, 12, 14, 16, 17, 19, 23]
+        _a15_cands = [g for g in _a15_preferred
+                      if g not in alu_groups and g not in _l4donors and g < ng - 2]
+        _a15_cands += [g for g in range(11, ng - 2)
+                       if g not in alu_groups and g not in _l4donors
+                       and g not in _a15_cands]
         sel15a_groups = set(_a15_cands[:SEL15A]) if use_l4 else set()
+        if use_l4 and os.environ.get("SEL15A_GROUPS"):
+            sel15a_groups = {int(g) for g in os.environ["SEL15A_GROUPS"].split(",") if g}
         # SEL4A：r=4 的 gather 也用纯 ALU 形式转 select——body 期系数标量已就绪（valu 形式
         # 才受死区广播限制）。候选组挑 r4 执行时刻落在 body alu 低谷（trace：b~450/b~650
         # ↔ g≈13/g≈20）的 valu 组；每组 −8 load / +296 alu（落在低谷则不顶 alu frontier）。
-        SEL4A = int(os.environ.get("SEL4A", "3"))
+        SEL4A = int(os.environ.get("SEL4A", "4" if VIRTUAL_TEMPS else "3"))
         _a4_cands = [g for g in [21, 13, 22, 19, 23, 18, 14, 17, 15, 11]
                      if g not in alu_groups and g not in _l4donors]
         sel4a_groups = set(_a4_cands[:SEL4A]) if use_l4 else set()
-        _a15_rank = {g: i for i, g in enumerate(sorted(sel15a_groups | sel4a_groups))}
+        if use_l4 and os.environ.get("SEL4A_GROUPS"):
+            sel4a_groups = {int(g) for g in os.environ["SEL4A_GROUPS"].split(",") if g}
+        _a15_rank_groups = (sel15_groups | sel15a_groups | sel4a_groups
+                            if VIRTUAL_TEMPS else sel15a_groups | sel4a_groups)
+        _a15_rank = {g: i for i, g in enumerate(sorted(_a15_rank_groups))}
         _a15_cond = [FV_raw + c * VLEN for c in range(nchunk)]  # fvraw：setup 后死区
         # 再补几个专属 cond 槽（预留 6*VLEN 给 emit 期才惰性分配的 rvec(1,2,4,8,11,13)）
         while ((sel15a_groups or sel4a_groups) and len(_a15_cond) < 8
@@ -901,7 +1137,56 @@ class KernelBuilder:
         # 被转换组的 cond 槽位按「转换组序号」分——alu 组全是 g%4==0，若沿用 g%4+bank 的槽位，
         # 所有转换组的 42 个 cond 写会挤在同一个 t2a 槽上跨组串行（实测 SEL15=6 时尾部 +20）。
         # 尾部时刻 t2a 的 8 个槽全已死亡（bank0 的 L2/L3 cond 在 body 用完），可全用。
-        _sel15_rank = {g: i for i, g in enumerate(_c15)}
+        _sel15_rank = {
+            g: i for i, g in enumerate(
+                sorted(sel15_groups | sel15a_groups) if VIRTUAL_TEMPS else _c15
+            )
+        }
+        VFLOW_MAIN_N = int(os.environ.get("VFLOW_MAIN_N", str(len(sel15_groups))))
+        VFLOW_A_N = int(os.environ.get(
+            "VFLOW_A_N", "3" if VIRTUAL_TEMPS else str(len(sel15a_groups))
+        ))
+        vflow_groups = (
+            set(sorted(sel15_groups)[:VFLOW_MAIN_N])
+            | set(sorted(sel15a_groups)[:VFLOW_A_N])
+            if VIRTUAL_TEMPS else set()
+        )
+        PAIR_PREP_N = int(os.environ.get("PAIR_PREP_N", str(len(vflow_groups))))
+        if L4PAIR_PREP:
+            vflow_groups = set(sorted(vflow_groups)[:PAIR_PREP_N])
+            pair_prep_groups = set(vflow_groups)
+        else:
+            pair_prep_groups = set()
+        prepared_l4_pairs = set()
+
+        def emit_l4_pair_prep(g):
+            r = rounds - 1
+            idx = IDX + g * VLEN                    # r14 starts with mirrored R3
+            tmp, nv = virtual_temp(g, r, 0), virtual_temp(g, r, 1)
+            ca = _a15_cond[_a15_rank[g] % len(_a15_cond)]
+            Dhi, Bhi = pair_DE[(4, 7)]
+            Dlo, Blo = pair_DE[(4, 6)]
+            cmp_gt(True, ca, 0, idx, local=True)    # R3 >= 1
+            ops.append(("flow", ("vselect", nv, ca, Dlo, Dhi)))
+            ops.append(("flow", ("vselect", tmp, ca, Blo, Bhi)))
+            for step in range(2, 8):
+                Dv, Bv = pair_DE[(4, 7 - step)]
+                cmp_gt(True, ca, step - 1, idx, local=True)
+                ops.append(("flow", ("vselect", nv, ca, Dv, nv)))
+                ops.append(("flow", ("vselect", tmp, ca, Bv, tmp)))
+            prepared_l4_pairs.add((g, r))
+
+        preselected_l4 = set()
+
+        def emit_l4_preselect(g):
+            r = rounds - 1
+            b = g * VLEN
+            idx = IDX + b
+            tmp, nv = virtual_temp(g, r, 0), virtual_temp(g, r, 1)
+            rk = _sel15_rank[g]
+            t2a4 = TMP2A + (rk % 8) * VLEN
+            emit_node_select(True, 4, nv, tmp, t2a4, nv, idx)
+            preselected_l4.add((g, r))
 
         def uses_c5_folded_node(g, rr):
             """Whether round rr consumes an L1-L3 selector built from F^C5."""
@@ -925,12 +1210,16 @@ class KernelBuilder:
 
         def emit_gr(g, r):
                 b = g * VLEN
-                bp = _slot[g] * VLEN                              # nv/tmp 槽位（valu 组配对共享）
-                idx, val, tmp, nv = IDX + b, VAL + b, TMP + bp, NV + bp
-                if (SHAREPAIR and _slot[g] in _shared_slots
-                        and EMIT == "diagtail" and r >= rounds - TK):
-                    tmp = TMPT + _poolrank[g] * VLEN              # 共享组的尾轮走独立小池（见上）
-                    nv = NVT + _poolrank[g] * VLEN
+                idx, val = IDX + b, VAL + b
+                if VIRTUAL_TEMPS:
+                    tmp, nv = virtual_temp(g, r, 0), virtual_temp(g, r, 1)
+                else:
+                    bp = _slot[g] * VLEN                          # nv/tmp 槽位（valu 组配对共享）
+                    tmp, nv = TMP + bp, NV + bp
+                    if (SHAREPAIR and _slot[g] in _shared_slots
+                            and EMIT == "diagtail" and r >= rounds - TK):
+                        tmp = TMPT + _poolrank[g] * VLEN          # 共享组的尾轮走独立小池（见上）
+                        nv = NVT + _poolrank[g] * VLEN
                 # 共享临时槽位 = g%4 + 前后半程 bank：若「某组的晚轮」与「另一组的早轮」共槽，
                 # 程序序（wavefront 序）会把晚轮排前面，逼后者放弃跑前（run-ahead）、等 ~150 拍
                 # （diffsched 实证的 WAR 毒化）。按轮次分 bank 后共槽的只会是同期轮，天然错开。
@@ -938,6 +1227,7 @@ class KernelBuilder:
                 t2a = TMP2A + t2s
                 t2b = TMP2B + t2s
                 ua = (g in alu_groups) or (g == xg and r < EXTRA) or r < AE  # 该(组,轮)走标量 alu
+                hua23 = ua or g in HASH23_ALU_GROUPS
                 level = r % period
                 # node_val：去重层用线性 select，其余标量 gather。三处按「load 的时间分布」微调
                 # （load 总量与 valu 双双压 roofline 后，赢面在把 load 的活从尾部搬到头部空窗）：
@@ -959,14 +1249,23 @@ class KernelBuilder:
                     or (r == 4 and g in (sel4_groups | sel4a_groups))
                 ):
                     sel = True
-                if is_spec(g, r):
+                if (g, r) in prepared_l4_pairs:
+                    ca = _a15_cond[_a15_rank[g] % len(_a15_cond)]
+                    vop(ua, "&", ca, idx, ONE)       # fp=7: A parity equals child bit
+                    vmac(ua, nv, ca, nv, tmp)        # node = base + bit*diff
+                    nv_src = nv
+                elif (g, r) in preselected_l4:
+                    nv_src = nv
+                elif is_spec(g, r):
                     # 双子预取的 16 条 load 在此排放（程序序须先于下面读值的 vselect），
                     # parity 仍留在 tmp：一条 vselect 选出 node_val
                     ops.extend(_spec_pending.pop(g, []))
                     ops.append(("flow", ("vselect", nv, tmp, spec_slot(g), nv)))
                     nv_src = nv
                 elif sel and level == 4 and (
-                        (r == rounds - 1 and g in sel15a_groups)
+                        (r == rounds - 1
+                         and g in (sel15_groups | sel15a_groups)
+                         and g not in vflow_groups)
                         or (r == 4 and g in sel4a_groups)):
                     # 纯 ALU 逐 lane MAC 链（见 SEL15A）：acc=nv、Q=tmp、cond 用死区槽；
                     # 系数/阈值全是标量（l4de/fpp），不经广播、不占 valu。
@@ -987,7 +1286,9 @@ class KernelBuilder:
                 elif sel and level == 4:
                     rk = _sel15_rank[g]
                     t2a4 = TMP2A + (rk % 8) * VLEN
-                    if L4MAC:
+                    if VIRTUAL_TEMPS and r == rounds - 1 and g in vflow_groups:
+                        nv_src = emit_node_select(True, 4, nv, tmp, t2a4, nv, idx)
+                    elif L4MAC:
                         q2 = _q2[rk % len(_q2)] if _q2 else tmp
                         nv_src = emit_l4_macsel(ua, nv, tmp, t2a4, idx, q2)
                     else:
@@ -1040,7 +1341,7 @@ class KernelBuilder:
                 vop(ua, "^", val, val, tmp)
                 vmac(ua, tmp, val, K3P, C2X)                                  # 阶段3：u 直读阶段1 输出（与阶段2 并行）
                 vmac(ua, val, val, K2, C2C3)                                  # 阶段2（常量折入阶段3 的 +C3）
-                vop(ua, "^", val, val, tmp)                                   # result = b' ^ u
+                vop(hua23, "^", val, val, tmp)                                # result = b' ^ u
                 vmac(ua, val, val, K4, C4)                                    # 阶段4
                 vop(ua, ">>", tmp, val, S16)                                  # 阶段5
                 _fold0 = L0FOLD and r + 1 < rounds and (r + 1) % period == 0
@@ -1145,12 +1446,6 @@ class KernelBuilder:
             tgorder = list(range(ng))
             tail15 = [(g, rounds - 1) for g in range(ng)]
             if use_l4:
-                # 尾段各轮的组序都重排为「donor → 被转换组 → 其余」：尾段轮次按排放序在引擎
-                # frontier 上排队执行，被转换组的 r14/r15-select 必须排在前部才能被尾段吸收
-                # （否则其 select+hash 链 ~26 拍在队尾甩出新尾巴，实测 SEL15=6 时 +20）。
-                # r15 序中在 donor 之后注入系数广播（donor 的 tmp/nv 至此彻底死亡）。
-                # （试过把 donor 的 r14/r15 放回 body 对角线让广播更早就绪：donor 的 r15 gather
-                #   会在 load 流里插队、把中段组的 gather 全推后，反而 +13~+28，弃。）
                 _ds = set(_donors)
                 _cs = sorted(sel15_groups)
                 # TGPRI：尾段各轮「其余组」里让最末 TGPRI 个组排最前——它们是终链级联的头，
@@ -1162,19 +1457,100 @@ class KernelBuilder:
                     rest = [g for g in range(ng) if g not in exclude]
                     return rest[-TGPRI:][::-1] + rest[:-TGPRI] if TGPRI else rest
 
-                tgorder = _donors + _cs + _others(_ds | sel15_groups)
                 _a15s = sorted(sel15a_groups)
-                tail15 = ([(g, rounds - 1) for g in _donors] + [("L4BCAST", -1)] +
-                          [(g, rounds - 1) for g in _cs] +
-                          [(g, rounds - 1) for g in _a15s] +
-                          [(g, rounds - 1)
-                           for g in _others(_ds | sel15_groups | sel15a_groups)])
+                if VIRTUAL_TEMPS:
+                    _fg = _cs + _a15s
+                    vorder = os.environ.get("VFLOW_ORDER", "current")
+                    if vorder == "reverse":
+                        _fg = list(reversed(_fg))
+                    elif vorder == "desc":
+                        _fg = sorted(_fg, reverse=True)
+                    elif vorder == "interleave":
+                        _fg = [x for pair in zip(_cs, _a15s) for x in pair]
+                        _fg += [g for g in (_cs + _a15s) if g not in _fg]
+                    r14fg = list(reversed(_fg)) if os.environ.get("VFLOW_R14_REV", "0") == "1" else _fg
+                    tgorder = r14fg + _others(set(_fg))
+                    tail15 = ([(g, rounds - 1) for g in _fg] +
+                              [(g, rounds - 1) for g in _others(set(_fg))])
+                else:
+                    tgorder = _donors + _cs + _others(_ds | sel15_groups)
+                    tail15 = ([(g, rounds - 1) for g in _donors] + [("L4BCAST", -1)] +
+                              [(g, rounds - 1) for g in _cs] +
+                              [(g, rounds - 1) for g in _a15s] +
+                              [(g, rounds - 1)
+                               for g in _others(_ds | sel15_groups | sel15a_groups)])
             order = (body +
                      [(g, r) for r in range(rounds - TK, rounds - 1) for g in tgorder] +
                      tail15)
+            VBYPASS_MODE = int(os.environ.get("VBYPASS_MODE", "0"))
+            if VIRTUAL_TEMPS and use_l4 and VBYPASS_MODE:
+                bypass = [g for g in _fg if g in vflow_groups]
+                if os.environ.get("VBYPASS_ORDER", "asc") == "desc":
+                    bypass.reverse()
+                bypass = bypass[:int(os.environ.get("VBYPASS_N", str(len(bypass))))]
+                bypass_set = set(bypass)
+                prefix = (body +
+                          [(g, r) for r in range(rounds - TK, rounds - 2)
+                           for g in tgorder])
+                r14_rest = [(g, rounds - 2) for g in tgorder if g not in bypass_set]
+                r15_bypass = [(g, rounds - 1) for g in bypass]
+                r15_rest = [gr for gr in tail15 if gr[0] not in bypass_set]
+                paired_pre = [item for g in bypass
+                              for item in ((g, rounds - 2), ("L4PRE", g))]
+                if VBYPASS_MODE == 1:
+                    order = prefix + paired_pre + r15_bypass + r14_rest + r15_rest
+                elif VBYPASS_MODE == 2:
+                    order = prefix + paired_pre + r14_rest + r15_bypass + r15_rest
+                elif VBYPASS_MODE == 3:
+                    order = (prefix +
+                             [item for g in bypass
+                              for item in ((g, rounds - 2), ("L4PRE", g),
+                                           (g, rounds - 1))] +
+                             r14_rest + r15_rest)
+                elif VBYPASS_MODE == 4:
+                    order = (prefix + [(g, rounds - 2) for g in bypass] +
+                             [("L4PRE", g) for g in bypass] + r15_bypass +
+                             r14_rest + r15_rest)
+            PAIR_PREP_MODE = int(os.environ.get("PAIR_PREP_MODE", "1"))
+            if L4PAIR_PREP and pair_prep_groups:
+                assert TK >= 3
+                pg = [g for g in tgorder if g in pair_prep_groups]
+                pset = set(pg)
+                prefix = (body +
+                          [(g, r) for r in range(rounds - TK, rounds - 3)
+                           for g in tgorder])
+                r13_all = [(g, rounds - 3) for g in tgorder]
+                r13_rest = [(g, rounds - 3) for g in tgorder if g not in pset]
+                r14_all = [(g, rounds - 2) for g in tgorder]
+                r14_rest = [(g, rounds - 2) for g in tgorder if g not in pset]
+                markers = [("L4PAIR", g) for g in pg]
+                if PAIR_PREP_MODE == 1:
+                    order = prefix + r13_all + markers + r14_all + tail15
+                elif PAIR_PREP_MODE == 2:
+                    order = (prefix + r13_all +
+                             [item for g in pg
+                              for item in (("L4PAIR", g), (g, rounds - 2))] +
+                             r14_rest + tail15)
+                elif PAIR_PREP_MODE == 3:
+                    order = (prefix +
+                             [item for g in pg
+                              for item in ((g, rounds - 3), ("L4PAIR", g))] +
+                             r13_rest + r14_all + tail15)
+                elif PAIR_PREP_MODE == 4:
+                    order = (prefix +
+                             [item for g in pg
+                              for item in ((g, rounds - 3), ("L4PAIR", g),
+                                           (g, rounds - 2))] +
+                             r13_rest + r14_rest + tail15)
         else:  # group-major 回退
             order = [(g, r) for g in range(ng) for r in range(rounds)]
         for g, r in order:
+            if g == "L4PAIR":
+                emit_l4_pair_prep(r)
+                continue
+            if g == "L4PRE":
+                emit_l4_preselect(r)
+                continue
             if g == "L4BCAST":
                 for j in range(8):
                     Dv, Ev = pair_DE[(4, j)]
@@ -1191,7 +1567,14 @@ class KernelBuilder:
             ops.append(("store", ("vstore", vbase[g], VAL + g * VLEN), ("io", g)))
 
         self._ops = ops  # 供 logix 工具（roofline/关键路径/调度诊断）直接取算子流
-        instrs = schedule(ops)
+        instrs = schedule_dag(ops) if os.environ.get("DAG_SCHED", "0") == "1" else schedule(ops)
+        if VIRTUAL_TEMPS:
+            colors, ncolors = color_virtual_vectors(
+                instrs, _VIRTUAL_VEC_BASE, n_virtual_temp_vecs
+            )
+            temp_base = self.alloc_scratch("virtual_temps", ncolors * VLEN)
+            instrs = rewrite_virtual_vectors(instrs, _VIRTUAL_VEC_BASE, colors, temp_base)
+            self.virtual_temp_colors = ncolors
         # 注入两条 pause（见 ops 开头的注释）：
         # 起始 pause 放进第一个 flow 有空槽的 bundle（此前全是 setup，无内存写 → run1 的
         # 检查读到的 inp_values 原封不动）；结束 pause 放进最后一个 bundle（store 同拍已提交）。
